@@ -1,0 +1,22 @@
+---
+title: "Energy flux and stability across a natural stream temperature gradient"
+author: "Nate Heili"
+date: "2025-11-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Using energetic food web models to assess ecological stability
+Ecologists have long sought to understand how ecosystems respond to disturbance. Theory and empirical work increasingly show that interaction strengths in complex communities are not random; instead, their organization can reveal not only how energy and materials flow through a system, but also how that system responds to perturbations. Stability can be quantified in numerous ways and has evolved through several major conceptual shifts since May (1973).
+
+In this tutorial, I use empirical data from a broad stream thermal gradient (Junker et al. 2024) to construct Jacobian matrices using the fluxweb package (Gauzens et al. 2019).
+
+```{r}
+library(fluxweb)
+library(tidyverse)
+```
+
+
