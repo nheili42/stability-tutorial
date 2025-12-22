@@ -1,0 +1,11 @@
+# This file serves as a metadata file for the data folder. I will update this to something proper in the near future.
+# This folder contains five (5) data files in rds form:
+# 1) annual_tempkt.rds - data.frame (1 row x 6 cols). mean annual absolute temperature in each stream. The columns are incorrectly named {stream}_tempC.
+# 2) diet_df.rds - data.frame (509 rows x 4 cols). Site by season diet proportions for all taxa. This was used to model diets that are provided in the `diet_matrices.rds` object
+# 3) diet_matrices.rds - nested list (6 sites x 3 seasons x 1000 boots x # spp + 7 x # spp + 7). This object contains seasonal diet matrices of modeled diet proportions for each species in each stream. There are 1000 bootstrapped matrices for each site-season combination. The bootstrapped samples, e.g., 'X1','X2',...'X1000', are extraced posterior from a hierarchical Bayesian model.
+# 4) diet-dir-brms_m2.rds - list (brms model output). This is the fitted model for seasonal diets.
+# 5) prod_full_fin.rds - nested list (6 sites x 3 data.frames x # spp * 1000 rows x 5 cols). This is the full bootstrapped production data frame. It contains bootstrap estimates of production, biomass, and abundance for each species for each interval in each site. Each variable, (i.e. production, biomass, abundance) is in a separate list.
+# 6) production_boots - nested list. This contains estimated production aggregated at different levels of organization (community vs species) and time frames (interval vs annual).
+# 7) seasonal_boot_split.rds - nested list. This is species-level production split into seasonal components for estimating fluxes with `diet_matrices` and the `estimate_flux()` function in the code. This was done with   `{r} flux_estimates = estimate_flux(diet_matrices, seasonal_boot_split)`
+# 8) stream_temps_full.rds - list. Interval temperature data for each stream in 1/kT. Can convert to C with `overkt_to_C()`
+# 9) taxaDf.rds - data.frame. Species list with taxonomy and group names
