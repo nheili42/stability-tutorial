@@ -1,0 +1,2250 @@
+---
+title: "eflux_bio_bootstrap"
+author: "Nate Heili"
+date: "2026-03-08"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Using energetic food web models to assess ecological stability
+
+*"Food webs and their models are at best caricatures of reality, and thus have both the truth and the falsity of caricature."* May 1973
+
+Ecologists have long sought to understand how ecosystems respond to disturbances. Theory and empirical work suggest that **interaction strengths** within complex communities are key determinants of how a system responds to perturbation. Specifically, communities with a high frequency of weak interactions can dampen the effects of species loss following a disturbance. One way to quantify interaction strengths is by estimating energy fluxes through the food web network, which can be used to construct a Jacobian matrix describing the per-capita effect of each species on every other. Eigenanalysis of the Jacobian then characterizes the dynamics of pertubations and global stability, with the real part of the dominant eigenvalue indicating whether the community will return to quilibrium following a disturbance.
+
+In this tutorial, I use empirical food web data from a broad stream thermal gradient (Junker et al. 2024) to construct Jacobian matrices of interaction strengths using a bioenergetic modelling approach in the *fluxweb* package (Moore and de Ruiter 2012; Gauzens et al. 2019). To propogate uncertainty in population biomass estimates, I iterate this process across bootstrapped communities, yielding distributions of energy fluxes and stability estimates rather than single point estimates.  
+
+```{r}
+# Clean environemnt 
+#rm(list = ls())
+
+# load packages
+library(fluxweb)
+library(tidyverse)
+library(readr)
+library(ggridges)
+
+```
+
+# Load data
+Data for the bioenergetic model (from Junker et al.) are stored on my GitHub page *https://github.com/nheili42/stability-tutorial*. The metadata file explaining the contents of each data source is on Github. I load the cleaned community dataframe and the associated diet matrix. Code to reproduce data wrangling is found on Github. 
+
+The community df includes bootstrap estimates of pop biomass for each site on a given date, with the associated temp-dependent metabolic rate (Jochum et al. 2017; Brown et al. 2004) and assimilation efficiency (Lang et al. 2017). The diet matrix includes seasonal and annual diet proportions, summarized from a Bayesian model. This matrix will need to be cleaned up to match the community df inputs once we use the fluxing function from fluxwebs.
+
+```{r}
+community <- readRDS("data/community.rds")
+diet <- readRDS("data/diet_matrices_clean.rds")
+```
+
+# Fluxing and stability
+I estimate energy fluxes across bootstrap estimates, giving a range of plausible fluxes based on variation in population biomasses. Diet matrix proportions were derived from gut content analysis and therefore represent realized feeding proportions; consequently bioms.prefs = FALSE was used so that observed proportions were not overridden by biomass-weighting. I decided to set basal resource biomass to 0 mg/m2 - I am exploring a way to think about how we might quantify these biomass stocks for my PhD. Either way, we will be able to estimate the amount of each resource needed to support consumers, therefore be able to compare across streams. 
+
+```{r load functions for energy fluxes}
+
+# =============================================================================
+# FUNCTION 1: prep_community()
+# Filter community data by site x season, aggregate boots, fix zero biomass
+# =============================================================================
+
+prep_community <- function(community_df, site_name, season_name = NULL, diet_mat) {
+  
+  sp_order <- rownames(diet_mat)
+  
+  df <- community_df %>% filter(site == site_name)
+  if (!is.null(season_name)) df <- df %>% filter(season == season_name)
+  if (nrow(df) == 0) return(NULL)
+  
+  if (!all(sp_order %in% unique(df$taxon_id))) {
+    missing <- setdiff(sp_order, unique(df$taxon_id))
+    warning(paste("Missing taxa for", site_name,
+                  ifelse(is.null(season_name), "annual", season_name), ":",
+                  paste(missing, collapse = ", ")))
+    return(NULL)
+  }
+  
+  agg <- df %>%
+    group_by(boot_id, taxon_id) %>%
+    summarise(
+      bio_g_m            = mean(bio_g_m,            na.rm = TRUE),
+      metrate_J_day_gram = mean(metrate_J_day_gram,  na.rm = TRUE),
+      ae_temp            = mean(ae_temp,             na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # global fallback so always-zero taxa are also covered ---
+  global_min_bio  <- agg %>% filter(bio_g_m > 0)            %>% pull(bio_g_m)            %>% min(na.rm = TRUE)
+  global_min_loss <- agg %>% filter(metrate_J_day_gram > 0) %>% pull(metrate_J_day_gram) %>% min(na.rm = TRUE)
+  
+  # Per-taxon minimum where available, global minimum as backstop
+  placeholders <- agg %>%
+    filter(bio_g_m > 0 & metrate_J_day_gram > 0) %>%
+    group_by(taxon_id) %>%
+    summarise(
+      ph_bio  = min(bio_g_m,            na.rm = TRUE) * 0.01,
+      ph_loss = min(metrate_J_day_gram,  na.rm = TRUE) * 0.01,
+      .groups = "drop"
+    )
+  
+  # Full species list so always-zero taxa get the global fallback
+  all_taxa <- tibble(taxon_id = sp_order) %>%
+    left_join(placeholders, by = "taxon_id") %>%
+    mutate(
+      ph_bio  = coalesce(ph_bio,  global_min_bio  * 0.01),
+      ph_loss = coalesce(ph_loss, global_min_loss * 0.01)
+    )
+  
+  agg %>%
+    left_join(all_taxa, by = "taxon_id") %>%
+    mutate(
+      bio_g_m            = case_when(
+        is.na(bio_g_m)  | bio_g_m  == 0 ~ ph_bio,
+        TRUE                             ~ bio_g_m),
+      metrate_J_day_gram = case_when(
+        is.na(metrate_J_day_gram) | metrate_J_day_gram == 0 ~ ph_loss,
+        TRUE                                                  ~ metrate_J_day_gram)
+    ) %>%
+    select(-ph_bio, -ph_loss)
+}
+
+# =============================================================================
+# FUNCTION 2: run_fluxes()
+# Run fluxing() across all bootstraps for one site x temporal scale
+# =============================================================================
+
+run_fluxes <- function(community_agg, diet_mat) {
+  
+  sp_order <- rownames(diet_mat)
+  boot_ids <- unique(community_agg$boot_id)
+  
+  flux_list <- lapply(boot_ids, function(b) {
+    
+    df_b <- community_agg %>%
+      filter(boot_id == b) %>%
+      arrange(match(taxon_id, sp_order))
+    
+    if (nrow(df_b) != nrow(diet_mat)) {
+      warning(paste("Boot", b, "row mismatch — skipping"))
+      return(NULL)
+    }
+    if (!all(df_b$taxon_id == sp_order)) {
+      warning(paste("Boot", b, "order mismatch — skipping"))
+      return(NULL)
+    }
+    
+    tryCatch(
+      fluxing(
+        mat          = diet_mat,
+        biomasses    = df_b$bio_g_m,
+        losses       = df_b$metrate_J_day_gram,
+        efficiencies = df_b$ae_temp,
+        bioms.prefs  = FALSE,  # GCA diet proportions used as-is
+        bioms.losses = TRUE,   # losses are per-gram, scaled internally
+        ef.level     = "prey"  # ae is a property of the prey
+      ),
+      error = function(e) { warning(paste("Boot", b, ":", e$message)); NULL }
+    )
+  })
+  
+  names(flux_list) <- boot_ids
+  Filter(Negate(is.null), flux_list)
+}
+
+```
+
+# Jacobian matrices for stability
+Once I derive energy fluxes, I convert them to Jacobian matrices which describe the local linear dynamics of the consumer community at equilibrium. Each element quantifies the per-capita effect of one taxon on another's instantaneous rate of change, with signs and magnitudes determined by the underlying trophic interaction structure and energetic constraints. From the eigenvalues of this community matrix, I extract two stability metrics: resilience, the rate at which the community returns to equilibrium following a small perturbation, and reactivity, the maximum rate at which perturbations amplify before that return begins. I follow the analytical approach described in Bazin et al., 2025.
+
+```{r load functions for Jacobian}
+
+# =============================================================================
+# FUNCTION 3: flux_to_jacobian()
+# Bazin et al. create.jacob formulation WITH self-damping diagonal
+#
+# Off-diagonal: identical to Bazin —
+#   jacob = t(flux_mat) * ae - flux_mat
+#   jacob = sweep(jacob, MARGIN=2, biomasses, '/')
+#
+# Diagonal (added here, absent in Bazin):
+#   J[i,i] = -(total metabolic loss + total predation loss on i) / biomass[i]
+#   = -(loss_per_gram[i] * biomass[i] + sum(flux_mat[i,])) / biomass[i]
+#   = -loss_per_gram[i] - sum(flux_mat[i,]) / biomass[i]
+# =============================================================================
+
+flux_to_jacobian <- function(flux_mat, biomass_vec, loss_vec, ae_vec) {
+  
+  n        <- nrow(flux_mat)
+  sp_order <- rownames(flux_mat)
+  
+  # Guard: check for zero/NA biomass before proceeding
+  if (any(is.na(biomass_vec)) || any(biomass_vec == 0)) {
+    problem_sp <- sp_order[is.na(biomass_vec) | biomass_vec == 0]
+    warning(paste("Zero/NA biomass for:", paste(problem_sp, collapse = ", "),
+                  "— Jacobian will have Inf. Returning NULL."))
+    return(NULL)
+  }
+  
+  # Off-diagonal: Bazin formulation
+  # t(flux_mat) * ae_vec: gains (prey j -> predator i, scaled by ae of prey j)
+  # - flux_mat: losses (flux out of i to all consumers)
+  jacob <- t(flux_mat) * ae_vec - flux_mat
+  
+  # Divide each column j by biomass of species j
+  jacob <- sweep(jacob, MARGIN = 2, biomass_vec, "/")
+  
+  # Self-damping diagonal (departure from Bazin)
+  # Total loss on species i = metabolic loss + predation loss
+  # Both divided by biomass[i] to get per-capita rate
+  for (i in seq_len(n)) {
+    if (biomass_vec[i] > 0) {
+      metabolic_loss  <- loss_vec[i]                           # already per gram
+      predation_loss  <- sum(flux_mat[i, ]) / biomass_vec[i]  # flux out / biomass
+      jacob[i, i]     <- -(metabolic_loss + predation_loss)
+    } else {
+      jacob[i, i] <- 0
+    }
+  }
+  
+  rownames(jacob) <- colnames(jacob) <- sp_order
+  jacob
+}
+
+
+# =============================================================================
+# FUNCTION 4: jacobian_stability()
+# Following the approach of Bazin et al. stability metrics
+# Resilience  = max(Re(eigenvalues(J)))       positive = unstable
+# Reactivity  = max(eigenvalues(H))           H = (J + J^T) / 2
+# =============================================================================
+
+jacobian_stability <- function(J) {
+  
+  eigs        <- eigen(J, only.values = TRUE)$values
+  resilience  <- max(Re(eigs))
+  
+  J_hermitian <- (J + t(Conj(J))) / 2
+  reactivity  <- max(Re(eigen(J_hermitian, only.values = TRUE)$values))
+  
+  tibble(
+    resilience = resilience,    # λJmax: more positive = more unstable (long-term)
+    reactivity = reactivity,    # λHmax: more positive = more reactive (short-term)
+    is_stable  = resilience < 0
+  )
+}
+
+
+# =============================================================================
+# FUNCTION 5: extract_interaction_strengths()
+# Off-diagonal Jacobian elements as tidy tibble
+# =============================================================================
+
+extract_interaction_strengths <- function(J) {
+  
+  sp_order <- rownames(J)
+  
+  expand.grid(recipient = sp_order, actor = sp_order,
+              stringsAsFactors = FALSE) %>%
+    as_tibble() %>%
+    filter(recipient != actor) %>%
+    mutate(
+      interaction_strength = map2_dbl(recipient, actor, ~ J[.x, .y]),
+      direction = case_when(
+        interaction_strength > 0 ~ "positive",
+        interaction_strength < 0 ~ "negative",
+        TRUE                     ~ "zero"
+      )
+    ) %>%
+    filter(interaction_strength != 0)
+}
+
+```
+
+
+
+
+
+```{r}
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+basal_taxa <- c("amorphous_detritus", "animal", "cyanobacteria",
+                "diatom", "filamentous", "green_algae", "plant_material")
+
+# Season assignment, based on GCA timing: first = Jan-Apr, second = May-Aug, third = Sep-Dec
+community <- community %>%
+  mutate(season = case_when(
+    month(date_id) %in% 1:4  ~ "first",
+    month(date_id) %in% 5:8  ~ "second",
+    month(date_id) %in% 9:12 ~ "third"
+  ))
+
+seasons <- c("first", "second", "third")
+sites   <- names(diet)
+
+# =============================================================================
+# MASTER LOOP: all sites x annual + seasonal
+# =============================================================================
+
+results <- map(sites, function(s) {
+  
+  message("\n=== Site: ", s, " ===")
+  
+  # --- ANNUAL ---
+  message("  Annual...")
+  diet_ann     <- diet[[s]][["annual"]]
+  comm_ann     <- prep_community(community, s, season_name = NULL, diet_ann)
+  annual_out   <- if (!is.null(comm_ann)) process_one_scale(comm_ann, diet_ann) else NULL
+  
+  # --- SEASONAL ---
+  seasonal_out <- map(seasons, function(ss) {
+    message("  Season: ", ss)
+    diet_seas  <- diet[[s]][["season_means"]][[ss]]
+    if (is.null(diet_seas)) return(NULL)
+    comm_seas  <- prep_community(community, s, ss, diet_seas)
+    if (is.null(comm_seas)) return(NULL)
+    process_one_scale(comm_seas, diet_seas)
+  }) %>% set_names(seasons)
+  
+  list(annual = annual_out, seasonal = seasonal_out)
+  
+}) %>% set_names(sites)
+
+# =============================================================================
+# FLATTEN TO ANALYSIS-READY TIBBLES
+# =============================================================================
+
+# Helper to safely extract with labels
+extract_df <- function(results, element) {
+  map_dfr(sites, function(s) {
+    
+    ann <- results[[s]]$annual[[element]]
+    if (!is.null(ann)) ann <- ann %>%
+        mutate(site = s, scale = "annual", season = NA_character_)
+    
+    seas <- map_dfr(seasons, function(ss) {
+      x <- results[[s]]$seasonal[[ss]][[element]]
+      if (!is.null(x)) x %>%
+          mutate(site = s, scale = "seasonal", season = ss)
+    })
+    
+    bind_rows(ann, seas)
+  })
+}
+
+stability_all     <- extract_df(results, "stability_summary")
+interactions_all  <- extract_df(results, "interaction_strengths")
+
+```
+
+
+# Stability visualizations
+```{r}
+head(stability_all)
+
+hist(stability_all$resilience)
+hist(stability_all$reactivity)
+
+
+
+
+```
+
+Visualizing the interaction strengths from the off-diagonal Jacobian output - the per-capita effect of each species on another. Values are incredibly large because of the 0gm-2 basal biomass assumption.
+```{r}
+
+# Base R skewness function
+skewness_base <- function(x) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  m <- mean(x)
+  s <- sd(x)
+  (sum((x - m)^3) / n) / s^3
+}
+
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+site_order  <- c("st14", "oh2", "st7", "st9", "st6", "hver")
+site_colors <- c(st14="#2C7BB6", oh2="#5AAE61", st7="#A6D96A",
+                 st9="#FDAE61", st6="#F46D43", hver="#D73027")
+
+int_sum <- interactions_all %>%
+  group_by(site, scale, season) %>%
+  summarise(
+    mean_abs = mean(abs(interaction_strength)),
+    var_abs  = var(abs(interaction_strength)),
+    skew_abs = skewness_base(abs(interaction_strength)),
+    cv_abs   = sd(abs(interaction_strength)) / mean(abs(interaction_strength)),
+    .groups  = "drop"
+  ) %>%
+  mutate(
+    site = factor(site, levels = site_order),
+    time_label = case_when(
+      scale == "annual"   ~ "Annual",
+      season == "first"   ~ "Jan–Apr",
+      season == "second"  ~ "May–Aug",
+      season == "third"   ~ "Sep–Dec"
+    ),
+    time_label = factor(time_label, 
+                        levels = c("Annual","Jan–Apr","May–Aug","Sep–Dec"))
+  )
+
+# Label which direction each J_ij represents
+interactions_all <- interactions_all %>%
+  mutate(j_type = case_when(
+    interaction_strength > 0 ~ "resource_effect_on_consumer",  # artifact tail
+    interaction_strength < 0 ~ "consumer_effect_on_resource"   # real signal
+  ))
+
+# Analyze only the ecologically meaningful half
+interactions_real <- interactions_all %>%
+  filter(j_type == "consumer_effect_on_resource")
+
+# --- Plot 1: Skewness across gradient (most interpretable) ---
+p_skew <- ggplot(int_sum %>% filter(scale == "seasonal"),
+                 aes(x = time_label, y = skew_abs, 
+                     color = site, group = site)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 3) +
+  scale_color_manual(values = site_colors) +
+  labs(x = NULL, y = "Skewness of |J_ij|",
+       title = "Interaction strength skewness",
+       subtitle = "Higher = more dominated by rare strong interactions") +
+  theme_classic(base_size = 13)
+
+# --- Plot 2: CV as normalized dispersion (avoids scale artifact) ---
+p_cv <- ggplot(int_sum %>% filter(scale == "seasonal"),
+               aes(x = time_label, y = cv_abs,
+                   color = site, group = site)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 3) +
+  scale_color_manual(values = site_colors) +
+  labs(x = NULL, y = "CV of |J_ij|",
+       title = "Coefficient of variation",
+       subtitle = "Scale-free dispersion of interaction strengths") +
+  theme_classic(base_size = 13)
+
+# --- Plot 3: Ridge plot of raw |J_ij| distribution per site (annual) ---
+library(ggridges)
+
+p_ridge <- interactions_all %>%
+  filter(scale == "annual") %>%
+  mutate(site = factor(site, levels = rev(site_order)),
+         log_abs_J = log10(abs(interaction_strength) + 1)) %>%
+  ggplot(aes(x = log_abs_J, y = site, fill = site)) +
+  geom_density_ridges(alpha = 0.8, scale = 1.2) +
+  scale_fill_manual(values = site_colors) +
+  labs(x = expression(log[10]("|J"[ij]*"|")),
+       y = NULL,
+       title = "Distribution of interaction strengths (annual)",
+       subtitle = "Cold (top) → warm (bottom)") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+
+cr_annual <- interactions_real %>%
+  filter(scale == "annual") %>%
+  mutate(site = factor(site, levels = rev(site_order)),
+         log_abs_J = log10(abs(interaction_strength) + 1)) %>%
+  ggplot(aes(x = log_abs_J, y = site, fill = site)) +
+  geom_density_ridges(alpha = 0.8, scale = 1.2) +
+  scale_fill_manual(values = site_colors) +
+  labs(x = expression(log[10]("|J"[ij]*"|")),
+       y = NULL,
+       title = "Consumer-resource interaction strengths (annual) - off-diagonal Jacobian") +
+  theme_classic(base_size = 13)
+
+cr_annual_facetResource <-interactions_real %>%
+  filter(scale == "annual") %>%
+  mutate(site = factor(site, levels = rev(site_order)),
+         log_abs_J = log10(abs(interaction_strength) + 1)) %>%
+  ggplot(aes(x = log_abs_J, y = site, fill = site)) +
+  geom_density_ridges(alpha = 0.8, scale = 1.2) +
+  scale_fill_manual(values = site_colors) +
+  labs(x = expression(log[10]("|J"[ij]*"|")),
+       y = NULL,
+       title = "Consumer-resource interaction strengths (annual) - off-diagonal Jacobian, by resource") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none") +
+  facet_wrap(~recipient, ncol = 3)
+
+
+# Save tiff
+ggsave(
+  filename    = "figures/CRinteraction.tiff",
+  plot        = cr_annual,
+  width       = 8,
+  height      = 4.5,
+  units       = "in",
+  dpi         = 300,
+  compression = "lzw"  
+)
+
+# Save tiff
+ggsave(
+  filename    = "figures/CRinteraction_facet.tiff",
+  plot        = cr_annual_facetResource,
+  width       = 8,
+  height      = 4.5,
+  units       = "in",
+  dpi         = 300,
+  compression = "lzw"  
+)
+
+ggsave(
+  filename = "figures/CRinteraction_facet.pdf",
+  plot     = cr_annual_facetResource,
+  width    = 6,
+  height   = 4.5,
+  units    = "in"
+)
+
+ggsave(
+  filename = "figures/CRinteraction.pdf",
+  plot     = cr_annual,
+  width    = 6,
+  height   = 4.5,
+  units    = "in"
+)
+
+
+
+# --- Plot 4: Mean vs skewness stability space ---
+p_space <- ggplot(int_sum %>% filter(scale == "annual"),
+                  aes(x = log10(mean_abs), y = skew_abs, 
+                      color = site, label = site)) +
+  geom_point(size = 4) +
+  ggrepel::geom_text_repel(size = 4) +
+  scale_color_manual(values = site_colors) +
+  labs(x = expression(log[10]("mean |J"[ij]*")")),
+       y = "Skewness of |J_ij|",
+       title = "Interaction strength space") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+
+(p_skew | p_cv) / (p_ridge | p_space)
+
+
+# Pull annual Jacobian for st6 and find the strong interactions
+J_st6 <- results[["st6"]]$annual$jacobians[[1]]  # first bootstrap as example
+
+# Find the outlier pairs driving the tail
+as.data.frame(J_st6) %>%
+  rownames_to_column("recipient") %>%
+  pivot_longer(-recipient, names_to = "actor", values_to = "J") %>%
+  filter(recipient != actor, J != 0) %>%
+  arrange(desc(abs(J))) %>%
+  head(20)
+```
+
+
+
+
+```{r}
+# =============================================================================
+# EXTRACT FLUX MATRICES → long tidy tibble
+# columns: site, scale, season, boot_id, from (prey), to (consumer), flux_J
+# =============================================================================
+
+extract_fluxes <- function(results) {
+  map_dfr(sites, function(s) {
+    
+    # Annual
+    ann_fl <- results[[s]]$annual$flux_list
+    ann_df <- if (!is.null(ann_fl)) {
+      map_dfr(names(ann_fl), function(b) {
+        mat <- ann_fl[[b]]
+        as.data.frame(as.table(mat)) %>%          # melt matrix to long
+          setNames(c("prey", "consumer", "flux_J")) %>%
+          filter(flux_J > 0) %>%                  # drop true zeros
+          mutate(boot_id = b, site = s, 
+                 scale = "annual", season = NA_character_)
+      })
+    }
+    
+    # Seasonal
+    seas_df <- map_dfr(seasons, function(ss) {
+      fl <- results[[s]]$seasonal[[ss]]$flux_list
+      if (is.null(fl)) return(NULL)
+      map_dfr(names(fl), function(b) {
+        mat <- fl[[b]]
+        as.data.frame(as.table(mat)) %>%
+          setNames(c("from", "to", "flux_J")) %>%
+          filter(flux_J > 0) %>%
+          mutate(boot_id = b, site = s, 
+                 scale = "seasonal", season = ss)
+      })
+    })
+    
+    bind_rows(ann_df, seas_df)
+  })
+}
+
+flux_all    <- extract_fluxes(results)
+
+# =============================================================================
+# EXTRACT JACOBIANS → long tidy tibble
+# columns: site, scale, season, boot_id, actor, recipient, j_value
+# =============================================================================
+
+extract_jacobians <- function(results) {
+  map_dfr(sites, function(s) {
+    
+    # Annual
+    ann_jac <- results[[s]]$annual$jacobians
+    ann_df  <- if (!is.null(ann_jac)) {
+      map_dfr(names(ann_jac), function(b) {
+        J <- ann_jac[[b]]
+        as.data.frame(as.table(J)) %>%
+          setNames(c("recipient", "actor", "j_value")) %>%
+          mutate(boot_id = b, site = s, 
+                 scale = "annual", season = NA_character_)
+      })
+    }
+    
+    # Seasonal
+    seas_df <- map_dfr(seasons, function(ss) {
+      jac <- results[[s]]$seasonal[[ss]]$jacobians
+      if (is.null(jac)) return(NULL)
+      map_dfr(names(jac), function(b) {
+        J <- jac[[b]]
+        as.data.frame(as.table(J)) %>%
+          setNames(c("recipient", "actor", "j_value")) %>%
+          mutate(boot_id = b, site = s, 
+                 scale = "seasonal", season = ss)
+      })
+    })
+    
+    bind_rows(ann_df, seas_df)
+  })
+}
+
+
+jacobian_all <- extract_jacobians(results)
+
+
+site_colors <- c(
+  st14 = "#2C7BB6",  # deep blue (coldest)
+  oh2  = "#5AAE61",  # blue-green
+  st7  = "#A6D96A",  # green
+  st9  = "#FDAE61",  # orange
+  st6  = "#F46D43",  # orange-red
+  hver = "#D73027"   # red (warmest)
+)
+
+site_order <- c("st14", "oh2", "st7", "st9", "st6", "hver")
+
+# --- Flux: distribution of log10 fluxes per site (annual) ---
+flux_all %>%
+  filter(scale == "annual") %>%
+  mutate(site = factor(site, levels = site_order)) %>%
+  ggplot(aes(x = log10(flux_J), y = site, fill = site)) +
+  geom_density_ridges(alpha = 0.8) +
+  scale_fill_manual(values = site_colors) +
+  labs(
+    x = expression(log[10](Energy~flux~(J~m^{-2}~day^{-1}))),
+    y = NULL,
+    title = "Distribution of energy fluxes by site (annual)"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+
+
+st14 <- flux_all %>%
+  filter(site == "st14")
+
+# Seasonal fluxes
+flux_all %>%
+  filter(scale == "seasonal") %>%
+  mutate(
+    site = factor(site, levels = site_order),
+    season_label = case_when(
+      season == "first"  ~ "Jan–Apr",
+      season == "second" ~ "May–Aug",
+      season == "third"  ~ "Sep–Dec"
+    ),
+    season_label = factor(season_label, levels = c("Jan–Apr", "May–Aug", "Sep–Dec"))
+  ) %>%
+  ggplot(aes(x = season_label, y = log(flux_J), fill = site)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_fill_manual(values = site_colors) +
+  labs(
+    y     = expression(ln(Energy~flux~(J~m^{-2}~day^{-1}))),
+    x     = "Season",
+    title = "Seasonal energy flux distributions across the thermal gradient"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold", size = 12),
+    axis.text.y      = element_text(size = 10)
+  )
+
+
+
+# Seasonal visualizations 
+flux_seasonal_summary <- flux_all %>%
+  filter(scale == "seasonal") %>%
+  mutate(
+    site = factor(site, levels = site_order),
+    season_label = case_when(
+      season == "first"  ~ "Jan–Apr",
+      season == "second" ~ "May–Aug",
+      season == "third"  ~ "Sep–Dec"
+    ),
+    season_label = factor(season_label, levels = c("Jan–Apr", "May–Aug", "Sep–Dec"))
+  ) %>%
+  # Step 1: total flux per bootstrap (collapse across links)
+  group_by(site, season_label, boot_id) %>%
+  summarise(total_flux = sum(flux_J), .groups = "drop") %>%
+  # Step 2: summarise across bootstraps
+  group_by(site, season_label) %>%
+  summarise(
+    mean_flux   = mean(total_flux),
+    median_flux = median(total_flux),
+    lo_95       = quantile(total_flux, 0.025),
+    hi_95       = quantile(total_flux, 0.975),
+    lo_50       = quantile(total_flux, 0.25),    # inner 50% if you want to show IQR too
+    hi_50       = quantile(total_flux, 0.75),
+    .groups = "drop"
+  )
+
+
+# Annual summary (same structure as seasonal)
+flux_annual_summary <- flux_all %>%
+  filter(scale == "annual") %>%
+  mutate(site = factor(site, levels = site_order)) %>%
+  group_by(site, boot_id) %>%
+  summarise(total_flux = sum(flux_J), .groups = "drop") %>%
+  group_by(site) %>%
+  summarise(
+    mean_flux   = mean(total_flux),
+    median_flux = median(total_flux),
+    lo_95       = quantile(total_flux, 0.025),
+    hi_95       = quantile(total_flux, 0.975),
+    .groups     = "drop"
+  ) %>%
+  mutate(season_label = "Annual")
+
+# Derive annual from seasonal by averaging across seasons per bootstrap
+flux_annual_from_seasonal <- flux_all %>%
+  filter(scale == "seasonal") %>%
+  mutate(site = factor(site, levels = site_order)) %>%
+  # Step 1: total flux per site x season x boot
+  group_by(site, season, boot_id) %>%
+  summarise(total_flux = sum(flux_J), .groups = "drop") %>%
+  # Step 2: average across seasons within each boot
+  group_by(site, boot_id) %>%
+  summarise(annual_flux = mean(total_flux), .groups = "drop") %>%
+  # Step 3: summarise across boots
+  group_by(site) %>%
+  summarise(
+    mean_flux   = mean(annual_flux),
+    median_flux = median(annual_flux),
+    lo_95       = quantile(annual_flux, 0.025),
+    hi_95       = quantile(annual_flux, 0.975),
+    .groups     = "drop"
+  ) %>%
+  mutate(season_label = "Annual")
+
+# Rebuild combined plot with corrected annual
+flux_combined <- flux_seasonal_summary %>%
+  bind_rows(flux_annual_from_seasonal) %>%
+  mutate(
+    season_label = factor(season_label,
+                          levels = c("Jan–Apr", "May–Aug", "Sep–Dec", "Annual")),
+    site = factor(site, levels = site_order)
+  )
+
+p_mean <- ggplot(flux_combined,
+                 aes(x = season_label, y = mean_flux,
+                     fill = site, group = site)) +  # fill instead of colour
+  geom_vline(xintercept = 3.5, linetype = "dashed",
+             colour = "grey70", linewidth = 0.5) +
+  geom_pointrange(
+    aes(ymin = lo_95, ymax = hi_95, colour = site),
+    position = position_dodge(width = 0.3),
+    size     = 0.6,
+    colour   = "black",    # outline colour
+    linewidth = 0.5
+  ) +
+  geom_point(
+    aes(fill = site),
+    position = position_dodge(width = 0.3),
+    shape    = 21,         # filled circle with outline
+    size     = 3,
+    colour   = "black",    # outline colour
+    stroke   = 0.6         # outline thickness
+  ) +
+  geom_smooth(method = "lm") +
+  scale_fill_manual(values = site_colors) +
+  scale_colour_manual(values = site_colors, guide = "none") +  # hide duplicate legend
+  scale_y_log10() +
+  labs(
+    x    = NULL,
+    y    = expression(Total~energy~flux~(J~m^{-2}~d^{-1})),
+    fill = "Site"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text.x = element_text(
+      face = c("plain", "plain", "plain", "bold")
+    )
+  )
+
+p_mean
+
+
+# Save tiff
+ggsave(
+  filename    = "figures/seasonal_energy_flux.tiff",
+  plot        = p_mean,
+  width       = 8,
+  height      = 4.5,
+  units       = "in",
+  dpi         = 300,
+  compression = "lzw"  
+)
+
+# Save pdf
+ggsave(
+  filename = "figures/seasonal_energy_flux.pdf",
+  plot     = p_mean,
+  width    = 6,
+  height   = 4.5,
+  units    = "in"
+)
+
+
+flux_change <- flux_combined %>%
+  filter(season_label != "Annual") %>%          # seasonal only
+  group_by(site) %>%
+  mutate(
+    # Use Jan-Apr as baseline
+    baseline_median = median_flux[season_label == "Jan–Apr"],
+    baseline_mean   = mean_flux[season_label == "Jan–Apr"],
+    
+    # % change from Jan-Apr baseline
+    pct_change_median = ((median_flux - baseline_median) / baseline_median) * 100,
+    pct_change_mean   = ((mean_flux   - baseline_mean)   / baseline_mean)   * 100
+  ) %>%
+  ungroup()
+
+# Quick summary of peak season (May-Aug) % change by site
+flux_change %>%
+  filter(season_label == "May–Aug") %>%
+  select(site, baseline_median, median_flux, pct_change_median) %>%
+  arrange(desc(pct_change_median))
+
+
+
+
+# What drives the energy flux variation across the thermal gradient?
+
+# Correlate boot-level total flux with boot-level total biomass per site x season
+flux_all %>%
+  filter(scale == "seasonal") %>%
+  group_by(site, season, boot_id) %>%
+  summarise(total_flux = sum(flux_J), .groups = "drop") %>%
+  left_join(
+    community %>%
+      filter(!taxon_id %in% basal_taxa) %>%
+      group_by(site, season, boot_id) %>%
+      summarise(total_biomass = sum(bio_g_m),
+                mean_metrate  = mean(metrate_J_day_gram, na.rm = TRUE),
+                mean_bodysize = mean(ind_g, na.rm = TRUE),
+                .groups = "drop"),
+    by = c("site", "season", "boot_id")
+  ) %>%
+  ggplot(aes(x = log(mean_metrate), y = log(total_flux), colour = site)) +
+  geom_point(alpha = 0.3, size = 1) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_colour_manual(values = site_colors) +
+  facet_wrap(~ season) +
+  theme_classic()
+
+
+# Site-level annual means — flux vs temperature
+flux_annual_from_seasonal %>%
+  left_join(
+    community %>%
+      group_by(site) %>%
+      summarise(
+        mean_temp_C   = mean(celcius, na.rm = TRUE),
+        mean_bodysize = mean(ind_g[!taxon_id %in% basal_taxa], na.rm = TRUE),
+        total_biomass = mean(bio_g_m[!taxon_id %in% basal_taxa], na.rm = TRUE)
+      ),
+    by = "site"
+  ) %>%
+  ggplot(aes(x = mean_temp_C, y = mean_flux, colour = site, label = site)) +
+  geom_pointrange(aes(ymin = lo_95, ymax = hi_95)) +
+  geom_smooth(aes(group = 1), method = "lm", colour = "black", se = TRUE) +
+  ggrepel::geom_text_repel(size = 3) +
+  scale_colour_manual(values = site_colors) +
+  scale_y_log10() +
+  theme_classic() +
+  labs(x = "Mean annual temperature (°C)",
+       y = expression(Total~energy~flux~(J~m^{-2}~d^{-1})))
+
+
+# Community mean body size vs temperature
+community %>%
+  filter(!taxon_id %in% basal_taxa, ind_g > 0) %>%
+  group_by(site, season) %>%
+  summarise(
+    mean_bodysize = mean(ind_g, na.rm = TRUE),
+    mean_temp     = mean(celcius, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(site = factor(site, levels = site_order)) %>%
+  ggplot(aes(x = mean_temp, y = log(mean_bodysize),
+             colour = site, label = site)) +
+  geom_point(size = 3) +
+  geom_smooth(aes(group = 1), method = "lm", colour = "black") +
+  scale_colour_manual(values = site_colors) +
+  facet_wrap(~ season) +
+  theme_classic() +
+  labs(x = "Mean temperature (°C)",
+       y = "ln(Mean body size, g/ind)")
+
+```
+
+```{r}
+library(lme4)
+library(MuMIn)
+
+model_df <- flux_all %>%
+  filter(scale == "seasonal") %>%
+  group_by(site, season, boot_id) %>%
+  summarise(total_flux = sum(flux_J), .groups = "drop") %>%
+  left_join(
+    community %>%
+      filter(
+        !taxon_id %in% basal_taxa,
+        bio_g_m > 0,          # exclude placeholder zeros
+        ind_g > 1e-6,         # exclude nonsensical body sizes
+        n_ind_m > 0           # exclude zero abundance
+      ) %>%
+      group_by(site, season, boot_id) %>%
+      summarise(
+        total_biomass = sum(bio_g_m, na.rm = TRUE),
+        # biomass-weighted mean metabolic rate
+        mean_metrate  = weighted.mean(metrate_J_day_gram, 
+                                      w = bio_g_m, na.rm = TRUE),
+        # biomass-weighted mean body size
+        mean_bodysize = weighted.mean(ind_g, 
+                                      w = bio_g_m, na.rm = TRUE),
+        mean_temp     = mean(celcius, na.rm = TRUE),
+        .groups = "drop"),
+    by = c("site", "season", "boot_id")
+  ) %>%
+  mutate(across(c(total_flux, total_biomass,
+                  mean_metrate, mean_bodysize), log))
+
+head(model_df)
+
+# Quick sanity check — back-transform to original units
+model_df %>%
+  group_by(site) %>%
+  summarise(across(c(total_flux, total_biomass, mean_metrate, mean_bodysize),
+                   ~ mean(exp(.x)))) %>%
+  arrange(site)
+
+bs<- model_df %>%
+  mutate(site = factor(site, levels = site_order)) %>%
+  group_by(site) %>%
+  summarise(
+    mean_bs   = mean(exp(mean_bodysize)) * 1000,
+    lo_95     = quantile(exp(mean_bodysize), 0.025) * 1000,
+    hi_95     = quantile(exp(mean_bodysize), 0.975) * 1000,
+    mean_temp = mean(mean_temp)
+  ) %>%
+  mutate(site = factor(site, levels = site_order)) %>%  # re-apply after summarise
+  ggplot(aes(x = mean_temp, y = mean_bs, colour = site, label = site)) +
+  geom_pointrange(
+    aes(ymin = lo_95, ymax = hi_95, colour = site),
+    position = position_dodge(width = 0.3),
+    size     = 0.6,
+    colour   = "black",    # outline colour
+    linewidth = 0.5
+  ) +
+  geom_point(
+    aes(fill = site),
+    position = position_dodge(width = 0.3),
+    shape    = 21,         # filled circle with outline
+    size     = 3.7,
+    colour   = "black",    # outline colour
+    stroke   = 0.6         # outline thickness
+  ) +
+  scale_y_log10() +
+  scale_x_continuous(breaks = seq(0, 30, by = 5)) +
+  scale_fill_manual(values = site_colors, name = "Site") +
+  theme_classic(base_size = 13) +
+  labs(
+    x = "Mean annual temperature (°C)",
+    y = expression(Community~body~size~(mg~ind^{-1}))
+  )
+
+bs
+# Save tiff
+ggsave(
+  filename    = "figures/bodysize_temp.tiff",
+  plot        = bs,
+  width       = 7,
+  height      = 4.5,
+  units       = "in",
+  dpi         = 300,
+  compression = "lzw"
+)
+
+# Save pdf
+ggsave(
+  filename    = "figures/bodysize_temp.pdf",
+  plot        = bs,
+  width    = 7,
+  height   = 4.5,
+  units    = "in"
+)
+
+```
+
+```{r}
+# =============================================================================
+# FIGURE 1: Taxon-level flux contributions — stacked bars
+# Which consumers dominate total flux at each site, and does composition shift?
+# Built from annual flux_list — colSums per taxon per boot, then summarised
+# =============================================================================
+
+taxon_flux_annual <- map_dfr(sites, function(s) {
+  fl <- results[[s]]$annual$flux_list
+  if (is.null(fl)) return(NULL)
+  
+  map_dfr(names(fl), function(b) {
+    mat <- fl[[b]]
+    colSums(mat) %>%
+      enframe(name = "taxon_id", value = "flux_in") %>%
+      mutate(site = s, boot_id = b)
+  })
+})
+
+# Summarise: mean flux per taxon per site across boots
+taxon_flux_summary <- taxon_flux_annual %>%
+  filter(!taxon_id %in% basal_taxa, flux_in > 0) %>%
+  group_by(site, taxon_id) %>%
+  summarise(
+    mean_flux  = mean(flux_in,   na.rm = TRUE),
+    total_flux = sum(flux_in,    na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(site) %>%
+  mutate(
+    site_total   = sum(mean_flux),
+    pct_of_total = mean_flux / site_total * 100
+  ) %>%
+  ungroup() %>%
+  mutate(site = factor(site, levels = site_order))
+
+# Keep only taxa that contribute > 10% at any site; lump rest as "Other"
+dominant_taxa <- taxon_flux_summary %>%
+  group_by(taxon_id) %>%
+  summarise(max_pct = max(pct_of_total)) %>%
+  filter(max_pct > 5) %>%
+  pull(taxon_id)
+
+# --- Build plot dataframe with absolute flux per taxon ---
+taxon_flux_abs <- taxon_flux_summary %>%
+  mutate(taxon_id = if_else(taxon_id %in% dominant_taxa, taxon_id, "Other")) %>%
+  group_by(site, taxon_id) %>%
+  summarise(mean_flux = sum(mean_flux), .groups = "drop") %>%
+  mutate(site = factor(site, levels = site_order))
+
+# --- Count number of consumer taxa per site (before lumping) ---
+n_taxa_site <- taxon_flux_summary %>%
+  filter(taxon_id != "Other") %>%
+  group_by(site) %>%
+  summarise(n_taxa = n_distinct(taxon_id), .groups = "drop") %>%
+  mutate(site = factor(site, levels = site_order))
+
+# --- Total flux per site for label positioning ---
+site_totals <- taxon_flux_abs %>%
+  group_by(site) %>%
+  summarise(total = sum(mean_flux), .groups = "drop") %>%
+  left_join(n_taxa_site, by = "site")
+
+# --- Reorder taxon fill so "Other" always at bottom ---
+taxon_order <- c("Other", sort(dominant_taxa))
+taxon_flux_abs <- taxon_flux_abs %>%
+  mutate(taxon_id = factor(taxon_id, levels = taxon_order))
+
+# --- Combined figure ---
+p_combined <- ggplot(taxon_flux_abs,
+                     aes(x = site, y = mean_flux, fill = taxon_id)) +
+  geom_col(colour = "black", linewidth = 0.3, position = "stack") +
+  # Annotate n taxa above each bar
+  geom_text(
+    data     = site_totals,
+    aes(x = site, y = total, 
+        label = paste0("n = ", n_taxa)),
+    inherit.aes = FALSE,
+    vjust   = -0.5,
+    size    = 3.5,
+    colour  = "black"
+  ) +
+  scale_fill_manual(values = tax_cols, name = "Consumer taxon") +
+  scale_y_continuous(limits = c(0,80), expand = c(0,0),
+    labels = scales::label_comma()
+  ) +
+  labs(
+    x = NULL,
+    y = expression(Mean~total~energy~flux~(J~m^{-2}~d^{-1})),
+    title    = "Community energy flux across the thermal gradient",
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.text      = element_text(size = 9, face = "italic"),
+    legend.key.size  = unit(0.4, "cm"),
+    legend.title     = element_text(size = 10),
+    legend.position  = "right",
+    plot.subtitle    = element_text(size = 10, colour = "grey40"),
+    axis.text.x      = element_text(size = 11),
+    plot.margin      = margin(t = 5, r = 5, b = 25, l = 5)  # room for arrow
+  )
+
+p_combined
+
+# --- Save ---
+ggsave(
+  filename    = "figures/flux_combined.tiff",
+  plot        = p_combined,
+  width       = 9,
+  height      = 5.5,
+  units       = "in",
+  dpi         = 300,
+  compression = "lzw"
+)
+
+ggsave(
+  filename = "figures/flux_combined.pdf",
+  plot     = p_combined,
+  width    = 9,
+  height   = 5.5,
+  units    = "in"
+)
+
+
+# =============================================================================
+# FIGURE 2: Mass-specific flux across the thermal gradient
+# Total flux / total community biomass — separates biomass from metabolic signal
+# =============================================================================
+
+# Total biomass per site x boot (annual, consumers only)
+biomass_annual <- community %>%
+  filter(!taxon_id %in% basal_taxa, bio_g_m > 0) %>%
+  group_by(site, boot_id) %>%
+  summarise(total_bio = sum(bio_g_m, na.rm = TRUE), .groups = "drop")
+
+# Total flux per site x boot (annual)
+total_flux_annual <- taxon_flux_annual %>%
+  filter(!taxon_id %in% basal_taxa) %>%
+  group_by(site, boot_id) %>%
+  summarise(total_flux = sum(flux_in, na.rm = TRUE), .groups = "drop")
+
+# Mass-specific flux = total flux / total biomass (J g-1 day-1)
+ms_flux <- total_flux_annual %>%
+  left_join(biomass_annual, by = c("site", "boot_id")) %>%
+  mutate(ms_flux = total_flux / total_bio) %>%
+  group_by(site) %>%
+  summarise(
+    mean_ms   = mean(ms_flux,              na.rm = TRUE),
+    lo_95     = quantile(ms_flux, 0.025,   na.rm = TRUE),
+    hi_95     = quantile(ms_flux, 0.975,   na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  mutate(site = factor(site, levels = site_order))
+
+# Join annual temperature for x-axis
+site_temps <- community %>%
+  group_by(site) %>%
+  summarise(mean_temp_c = mean(celcius, na.rm = TRUE), .groups = "drop")
+
+ms_flux <- ms_flux %>%
+  left_join(site_temps, by = "site")
+
+p_ms_flux <- ggplot(ms_flux,
+                    aes(x = mean_temp_c, y = mean_ms, colour = site)) +
+  geom_smooth(aes(group = 1), method = "lm",
+              colour = "black", linewidth = 0.8, se = TRUE) +
+  geom_pointrange(aes(ymin = lo_95, ymax = hi_95), size = 0.8) +
+  scale_colour_manual(values = site_colors) +
+  scale_y_log10() +
+  labs(
+    x      = "Mean annual temperature (°C)",
+    y      = expression(Mass-specific~flux~(J~g^{-1}~d^{-1})),
+    colour = "Site",
+    title  = "Mass-specific energy flux across the thermal gradient",
+    subtitle = "Separates metabolic rate effect from standing biomass effect"
+  ) +
+  theme_classic(base_size = 13)
+
+# Print all three
+p_stacked
+p_ms_flux
+
+```
+
+
+
+```{r}
+focal_taxon <- "Simulium vittatum"  # swap to whatever coverage check reveals
+
+# --- Pull biomass and metabolic rate from community ---
+taxon_community <- community %>%
+  filter(taxon_id == focal_taxon, !taxon_id %in% basal_taxa) %>%
+  mutate(site = factor(site, levels = site_order))
+
+# --- Pull flux received by this taxon from flux_all ---
+taxon_flux <- flux_all %>%
+  filter(consumer == focal_taxon, scale == "annual") %>%
+  group_by(site, boot_id) %>%
+  summarise(total_flux_in = sum(flux_J), .groups = "drop") %>%
+  mutate(site = factor(site, levels = site_order))
+
+# --- Summarise across bootstraps ---
+bio_summary <- taxon_community %>%
+  group_by(site) %>%
+  filter(bio_g_m > 0) %>%
+  summarise(
+    mean_val = mean(bio_g_m, na.rm = TRUE),
+    lo_95    = quantile(bio_g_m, 0.025, na.rm = TRUE),
+    hi_95    = quantile(bio_g_m, 0.975, na.rm = TRUE),
+    .groups  = "drop"
+  ) %>%
+  mutate(metric = "Biomass (g m-2)")
+
+met_summary <- taxon_community %>%
+  group_by(site) %>%
+  filter(metrate_J_day_gram > 0) %>%
+  summarise(
+    mean_val = mean(metrate_J_day_gram, na.rm = TRUE),
+    lo_95    = quantile(metrate_J_day_gram, 0.025, na.rm = TRUE),
+    hi_95    = quantile(metrate_J_day_gram, 0.975, na.rm = TRUE),
+    .groups  = "drop"
+  ) %>%
+  mutate(metric = "Metabolic rate (J g-1 d-1)")
+
+bodysize_summary <- taxon_community %>%
+  group_by(site) %>%
+  filter(ind_g > 0) %>%
+  summarise(
+    mean_val = mean(ind_g, na.rm = TRUE),
+    lo_95    = quantile(ind_g, 0.025, na.rm = TRUE),
+    hi_95    = quantile(ind_g, 0.975, na.rm = TRUE),
+    .groups  = "drop"
+  ) %>%
+  mutate(metric = "Body size (g ind-1)")
+
+flux_summary <- taxon_flux %>%
+  group_by(site) %>%
+  filter(total_flux_in > 0) %>%
+  summarise(
+    mean_val = mean(total_flux_in, na.rm = TRUE),
+    lo_95    = quantile(total_flux_in, 0.025, na.rm = TRUE),
+    hi_95    = quantile(total_flux_in, 0.975, na.rm = TRUE),
+    .groups  = "drop"
+  ) %>%
+  mutate(metric = "Energy flux in (J m-2 d-1)")
+
+# --- Combine and plot ---
+combined <- bind_rows(bio_summary, met_summary, bodysize_summary, flux_summary) %>%
+  mutate(
+    metric = factor(metric, levels = c(
+      "Biomass (g m-2)",
+      "Metabolic rate (J g-1 d-1)",
+      "Body size (g ind-1)",
+      "Energy flux in (J m-2 d-1)"
+    )),
+    site = factor(site, levels = site_order)
+  )
+
+
+ggplot(combined, aes(x=site,y=mean_val, fill = site))+
+  geom_pointrange(aes(ymin = lo_95, ymax = hi_95, color = site),
+                  shape = 21,
+                  stroke = 0.6,
+                  size = 0.7) +
+  scale_fill_manual(values   = site_colors, guide = "none") +
+  scale_colour_manual(values = site_colors, guide = "none") +
+  scale_y_log10() +
+  facet_wrap(~metric) +
+  labs(
+    x        = NULL,
+    y        = "Site") +
+  theme_classic(base_size = 13) +
+  theme(
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold", size = 11),
+    legend.position  = "none",
+    axis.text.x      = element_text(angle = 30, hjust = 1, size = 10),
+    panel.spacing    = unit(1, "lines")
+  )
+
+
+# --- Shared theme ---
+taxon_theme <- theme_classic(base_size = 13) +
+  theme(
+    legend.position = "none",
+    axis.text.x     = element_text(angle = 30, hjust = 1, size = 10),
+    panel.spacing   = unit(1, "lines")
+  )
+
+# --- Helper to build each panel ---
+make_panel <- function(data, y_label) {
+  ggplot(data,
+         aes(x = site, y = mean_val, fill = site)) +
+    geom_pointrange(
+      aes(ymin = lo_95, ymax = hi_95, colour = site),
+      shape  = 21,
+      stroke = 0.6,
+      size   = 0.7
+    ) +
+    scale_fill_manual(values   = site_colors, guide = "none") +
+    scale_colour_manual(values = site_colors, guide = "none") +
+    scale_y_log10() +
+    scale_x_discrete(limits = site_order) +
+    labs(x = NULL,
+         y = y_label) +
+    taxon_theme
+}
+
+# --- Build each panel with correct y label ---
+p_bio <- make_panel(
+  bio_summary %>% mutate(site = factor(site, levels = site_order)),
+  expression(Biomass~(g~m^{-2}))
+)
+
+p_met <- make_panel(
+  met_summary %>% mutate(site = factor(site, levels = site_order)),
+  expression(Metabolic~rate~(J~g^{-1}~d^{-1}))
+)
+
+p_size <- make_panel(
+  bodysize_summary %>% mutate(site = factor(site, levels = site_order)),
+  expression(Body~size~(g~ind^{-1}))
+)
+
+p_flux <- make_panel(
+  flux_summary %>% mutate(site = factor(site, levels = site_order)),
+  expression(Energy~flux~(J~m^{-2}~d^{-1}))
+)
+
+# --- Combine ---
+p_taxon <- (p_bio | p_met) / (p_size | p_flux) +
+  plot_annotation(
+    title    = paste("Metabolic regime of", focal_taxon,
+                     "across the thermal gradient"),
+    theme    = theme(
+      plot.title    = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 10, colour = "grey40")
+    )
+  )
+
+p_taxon
+
+# --- Save ---
+ggsave(
+  filename    = paste0("figures/focal_taxon_", focal_taxon, ".tiff"),
+  plot        = p_taxon,
+  width       = 8,
+  height      = 7,
+  units       = "in",
+  dpi         = 300,
+  compression = "lzw"
+)
+
+ggsave(
+  filename = paste0("figures/focal_taxon_", focal_taxon, ".pdf"),
+  plot     = p_taxon,
+  width    = 8,
+  height   = 7,
+  units    = "in"
+)
+# --- Save ---
+ggsave(
+  filename    = paste0("figures/focal_taxon_", focal_taxon, ".tiff"),
+  plot        = p_taxon,
+  width       = 6,
+  height      = 7,
+  units       = "in",
+  dpi         = 300,
+  compression = "lzw"
+)
+```
+
+```{r}
+# =============================================================================
+# TURNOVER–STABILITY ANALYSIS
+# Does community-level energy turnover rate predict resilience and reactivity?
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# STEP 1: Extract total flux INTO each consumer, per boot x site x scale
+# Column sums of flux matrix = energy flowing from all resources to consumer i
+# -----------------------------------------------------------------------------
+
+turnover_boot <- map_dfr(sites, function(s) {
+  
+  # Annual
+  fl_ann <- results[[s]]$annual$flux_list
+  ann_out <- if (!is.null(fl_ann)) {
+    map_dfr(names(fl_ann), function(b) {
+      colSums(fl_ann[[b]]) %>%
+        enframe(name = "taxon_id", value = "flux_in") %>%
+        mutate(site = s, scale = "annual", season = "annual", boot_id = b)
+    })
+  }
+  
+  # Seasonal
+  seas_out <- map_dfr(seasons, function(ss) {
+    fl <- results[[s]]$seasonal[[ss]]$flux_list
+    if (is.null(fl)) return(NULL)
+    map_dfr(names(fl), function(b) {
+      colSums(fl[[b]]) %>%
+        enframe(name = "taxon_id", value = "flux_in") %>%
+        mutate(site = s, scale = "seasonal", season = ss, boot_id = b)
+    })
+  })
+  
+  bind_rows(ann_out, seas_out)
+})
+
+# -----------------------------------------------------------------------------
+# STEP 2: Pull boot-level consumer biomass from community df
+# Replicates the aggregation logic in prep_community():
+#   annual  = mean bio_g_m across all dates per boot x taxon
+#   seasonal = mean bio_g_m within season per boot x taxon
+# Use "annual" as sentinel (avoids NA-join issues with season column)
+# -----------------------------------------------------------------------------
+
+biomass_boot <- bind_rows(
+  # Annual: mean across all dates
+  community %>%
+    group_by(site, boot_id, taxon_id) %>%
+    summarise(bio_g_m = mean(bio_g_m, na.rm = TRUE), .groups = "drop") %>%
+    mutate(scale = "annual", season = "annual"),
+  
+  # Seasonal: mean within each season
+  community %>%
+    group_by(site, boot_id, taxon_id, season) %>%
+    summarise(bio_g_m = mean(bio_g_m, na.rm = TRUE), .groups = "drop") %>%
+    mutate(scale = "seasonal")
+)
+
+# -----------------------------------------------------------------------------
+# STEP 3: Join flux with biomass, compute per-consumer turnover rate
+# Turnover (day-1) = flux into consumer / consumer biomass
+# Exclude basal taxa — placeholder biomasses (~0) make their rates meaningless
+# -----------------------------------------------------------------------------
+
+turnover_rates <- turnover_boot %>%
+  left_join(biomass_boot,
+            by = c("site", "boot_id", "taxon_id", "scale", "season")) %>%
+  filter(
+    !taxon_id %in% basal_taxa,   # basal biomasses are placeholders
+    bio_g_m    > 0,              # guard against residual zeros
+    flux_in    > 0               # only fed consumers
+  ) %>%
+  mutate(turnover_rate = flux_in / bio_g_m)
+
+# -----------------------------------------------------------------------------
+# STEP 4: Community-level summary per boot
+# Biomass-weighted geometric mean turnover — weights large populations more
+# heavily, geometric mean appropriate because rates are log-normally distributed
+# -----------------------------------------------------------------------------
+
+turnover_community <- turnover_rates %>%
+  group_by(site, scale, season, boot_id) %>%
+  summarise(
+    mean_turnover  = exp(weighted.mean(log(turnover_rate), w = bio_g_m)),
+    n_consumers    = n(),
+    .groups = "drop"
+  )
+
+# -----------------------------------------------------------------------------
+# STEP 5: Join with stability metrics
+# Align sentinel "annual" back to NA_character_ for season after join
+# -----------------------------------------------------------------------------
+
+turnover_stability <- turnover_community %>%
+  left_join(
+    stability_all %>%
+      mutate(season = coalesce(season, "annual")) %>%   # match sentinel
+      select(site, scale, season, boot_id, resilience, reactivity, is_stable),
+    by = c("site", "scale", "season", "boot_id")
+  ) %>%
+  mutate(
+    season = if_else(season == "annual", NA_character_, season),
+    site   = factor(site, levels = c("st14", "oh2", "st7", "st9", "st6", "hver")),
+    log_turnover   = log(mean_turnover),
+    log_reactivity = log(reactivity)
+  )
+
+# Quick check: should have ~n_boots rows per site x scale combination
+turnover_stability %>%
+  count(site, scale, season)
+
+# =============================================================================
+# MODELS
+# Site as random intercept — accounts for non-independence within sites
+# and lets us ask whether the within-site turnover signal predicts stability
+# across the gradient
+# =============================================================================
+
+library(lme4)
+library(lmerTest)
+
+# Does turnover predict resilience?
+m_resilience <- lmer(resilience ~ log_turnover + (1 | site),
+                     data = turnover_stability)
+summary(m_resilience)
+
+# Does turnover predict reactivity?
+m_reactivity <- lmer(log_reactivity ~ log_turnover + (1 | site),
+                     data = turnover_stability)
+summary(m_reactivity)
+
+# Does the turnover-resilience slope shift across seasons?
+# This is the formal test of your drought/pulse-recovery intuition:
+# if the slope is steeper in one season, faster-turnover communities
+# gain proportionally more resilience during that period
+m_seasonal <- lmer(resilience ~ log_turnover * season + (1 | site),
+                   data = turnover_stability %>% filter(scale == "seasonal"))
+summary(m_seasonal)
+
+# =============================================================================
+# PLOTS
+# =============================================================================
+
+site_colors <- c(
+  st14 = "#2C7BB6", oh2 = "#5AAE61", st7 = "#A6D96A",
+  st9  = "#FDAE61", st6 = "#F46D43", hver = "#D73027"
+)
+
+season_labels <- c(first = "Jan–Apr", second = "May–Aug", third = "Sep–Dec")
+
+# --- Plot 1: Turnover vs Resilience ---
+# Each point is one bootstrap. Black line is the across-gradient trend.
+# Site-coloured points show whether the relationship is driven by
+# within-site variation or between-site differences in turnover regime.
+
+p_turnover_resilience <- ggplot(
+  turnover_stability,
+  aes(x = log_turnover, y = resilience, colour = site)
+) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_smooth(aes(group = 1), method = "lm",
+              colour = "black", linewidth = 1, se = TRUE) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = site_colors) +
+  facet_wrap(~scale, labeller = labeller(
+    scale = c(annual = "Annual", seasonal = "Seasonal")
+  )) +
+  labs(
+    x     = expression(ln(Turnover~rate)~(day^{-1})),
+    y     = expression(lambda[J]^max~"(resilience)"),
+    colour = "Site",
+    title = "Community turnover rate vs. resilience",
+    subtitle = "More negative resilience = faster return after perturbation"
+  ) +
+  theme_classic(base_size = 13)
+
+# --- Plot 2: Turnover vs Reactivity ---
+# Tests whether faster-turnover communities also amplify disturbances more
+# before recovering — the opposing force to resilience
+
+p_turnover_reactivity <- ggplot(
+  turnover_stability,
+  aes(x = log_turnover, y = log_reactivity, colour = site)
+) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_smooth(aes(group = 1), method = "lm",
+              colour = "black", linewidth = 1, se = TRUE) +
+  scale_colour_manual(values = site_colors) +
+  facet_wrap(~scale, labeller = labeller(
+    scale = c(annual = "Annual", seasonal = "Seasonal")
+  )) +
+  labs(
+    x     = expression(ln(Turnover~rate)~(day^{-1})),
+    y     = expression(log(lambda[H]^max)~"(reactivity)"),
+    colour = "Site",
+    title = "Community turnover rate vs. reactivity",
+    subtitle = "Higher reactivity = larger transient amplification before return"
+  ) +
+  theme_classic(base_size = 13)
+
+# --- Plot 3: Seasonal slopes ---
+# Core test of the drought-recovery question.
+# If the slope of turnover on resilience steepens in dry/low season,
+# fast-turnover communities gain disproportionate recovery advantage then.
+
+p_seasonal_slopes <- ggplot(
+  turnover_stability %>% filter(scale == "seasonal"),
+  aes(x = log_turnover, y = resilience, colour = site)
+) +
+  geom_point(alpha = 0.2, size = 0.7) +
+  geom_smooth(aes(group = 1), method = "lm",
+              colour = "black", linewidth = 1, se = TRUE) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = site_colors) +
+  facet_wrap(~season, labeller = labeller(season = season_labels)) +
+  labs(
+    x      = expression(ln(Turnover~rate)~(day^{-1})),
+    y      = expression(lambda[J]^max~"(resilience)"),
+    colour = "Site",
+    title  = "Does the turnover–resilience slope shift seasonally?",
+    subtitle = "A steeper slope in one season = turnover confers more recovery advantage then"
+  ) +
+  theme_classic(base_size = 13)
+
+p_turnover_resilience
+p_turnover_reactivity
+p_seasonal_slopes
+
+# =============================================================================
+# OPTION 1: Metabolic rate as pace-of-life axis
+# Mechanistically cleaner — metrate_J_day_gram IS the Jacobian diagonal
+# =============================================================================
+
+# Seasonal: biomass-weighted mean metrate within each season
+metrate_seasonal <- community %>%
+  filter(!taxon_id %in% basal_taxa, bio_g_m > 0) %>%
+  group_by(site, boot_id, season) %>%
+  summarise(
+    wmean_metrate = weighted.mean(log(metrate_J_day_gram), w = bio_g_m, na.rm = TRUE),
+    total_biomass = sum(bio_g_m, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(scale = "seasonal")
+
+# Annual: biomass-weighted mean metrate across all dates, ignoring season
+metrate_annual <- community %>%
+  filter(!taxon_id %in% basal_taxa, bio_g_m > 0) %>%
+  group_by(site, boot_id) %>%
+  summarise(
+    wmean_metrate = weighted.mean(log(metrate_J_day_gram), w = bio_g_m, na.rm = TRUE),
+    total_biomass = sum(bio_g_m, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(scale = "annual", season = "annual")
+
+metrate_community <- bind_rows(metrate_annual, metrate_seasonal)
+
+# Join with stability — coalesce NA season to "annual" sentinel only on
+# the stability side, since metrate_community already has explicit labels
+metrate_stability <- metrate_community %>%
+  left_join(
+    stability_all %>%
+      mutate(season = coalesce(season, "annual")) %>%
+      select(site, scale, season, boot_id, resilience, reactivity),
+    by = c("site", "scale", "season", "boot_id")
+  ) %>%
+  mutate(
+    site           = factor(site, levels = c("st14", "oh2", "st7", "st9", "st6", "hver")),
+    outlier        = resilience < quantile(resilience, 0.01, na.rm = TRUE),
+    log_reactivity = log(reactivity)
+  )
+
+# =============================================================================
+# MODELS — site-level rather than boot-level
+# The vertical clustering shows within-site turnover variance is negligible;
+# the signal is between sites. So model at the site level using boot
+# distributions to construct uncertainty, rather than pooling all boots.
+# =============================================================================
+
+# Summarise to site x season means with bootstrap CIs
+stability_metrate_summary <- metrate_stability %>%
+  filter(!outlier) %>%                          # remove numerical artifacts
+  group_by(site, scale, season) %>%
+  summarise(
+    metrate_mean     = mean(wmean_metrate,   na.rm = TRUE),
+    resilience_mean  = mean(resilience,      na.rm = TRUE),
+    resilience_lo    = quantile(resilience, 0.025, na.rm = TRUE),
+    resilience_hi    = quantile(resilience, 0.975, na.rm = TRUE),
+    reactivity_mean  = mean(log_reactivity,  na.rm = TRUE),
+    reactivity_lo    = quantile(log_reactivity, 0.025, na.rm = TRUE),
+    reactivity_hi    = quantile(log_reactivity, 0.975, na.rm = TRUE),
+    biomass_mean     = mean(total_biomass,   na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Linear model across sites — only 6 points per season so treat carefully
+# This is a pattern description, not a causal model
+m_metrate_resilience <- lm(
+  resilience_mean ~ metrate_mean,
+  data = stability_metrate_summary %>% filter(scale == "annual")
+)
+summary(m_metrate_resilience)
+
+m_metrate_seasonal <- lm(
+  resilience_mean ~ metrate_mean * season,
+  data = stability_metrate_summary %>% filter(scale == "seasonal")
+)
+summary(m_metrate_seasonal)
+
+# =============================================================================
+# PLOTS — site summaries with bootstrap CIs
+# Much more readable than plotting all boots; shows real between-site signal
+# =============================================================================
+
+site_colors <- c(
+  st14 = "#2C7BB6", oh2 = "#5AAE61", st7 = "#A6D96A",
+  st9  = "#FDAE61", st6 = "#F46D43", hver = "#D73027"
+)
+
+season_labels <- c(
+  annual = "Annual",
+  first  = "Jan–Apr",
+  second = "May–Aug",
+  third  = "Sep–Dec"
+)
+
+# --- Plot 1: Metabolic rate vs Resilience (annual) ---
+p_met_resilience_ann <- stability_metrate_summary %>%
+  filter(scale == "annual") %>%
+  ggplot(aes(x = metrate_mean, y = resilience_mean, colour = site)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_smooth(aes(group = 1), method = "lm",
+              colour = "black", linewidth = 0.8, se = TRUE) +
+  geom_pointrange(aes(ymin = resilience_lo, ymax = resilience_hi), size = 0.8) +
+  scale_colour_manual(values = site_colors) +
+  labs(
+    x      = expression(ln(Mass-specific~metabolic~rate)~(J~g^{-1}~day^{-1})),
+    y      = expression(lambda[J]^max~"(resilience)"),
+    colour = "Site",
+    title  = "Metabolic pace vs. resilience (annual)",
+    subtitle = "Points = site means; bars = 95% bootstrap CI"
+  ) +
+  theme_classic(base_size = 13)
+
+# --- Plot 2: Metabolic rate vs Resilience (seasonal, three panels) ---
+p_met_resilience_seas <- stability_metrate_summary %>%
+  filter(scale == "seasonal") %>%
+  mutate(season = factor(season,
+                         levels = c("first", "second", "third"),
+                         labels = c("Jan–Apr", "May–Aug", "Sep–Dec"))) %>%
+  ggplot(aes(x = metrate_mean, y = resilience_mean, colour = site)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_smooth(aes(group = 1), method = "lm",
+              colour = "black", linewidth = 0.8, se = TRUE) +
+  geom_pointrange(aes(ymin = resilience_lo, ymax = resilience_hi), size = 0.7) +
+  scale_colour_manual(values = site_colors) +
+  facet_wrap(~season) +
+  labs(
+    x      = expression(ln(Mass-specific~metabolic~rate)~(J~g^{-1}~day^{-1})),
+    y      = expression(lambda[J]^max~"(resilience)"),
+    colour = "Site",
+    title  = "Does the metabolic-rate–resilience slope shift seasonally?",
+    subtitle = "A steeper slope = stronger metabolic pace advantage in that season"
+  ) +
+  theme_classic(base_size = 13)
+
+# --- Plot 3: Metabolic rate vs Reactivity ---
+p_met_reactivity <- stability_metrate_summary %>%
+  filter(scale == "seasonal") %>%
+  mutate(season = factor(season,
+                         levels = c("first", "second", "third"),
+                         labels = c("Jan–Apr", "May–Aug", "Sep–Dec"))) %>%
+  ggplot(aes(x = metrate_mean, y = reactivity_mean, colour = site)) +
+  geom_smooth(aes(group = 1), method = "lm",
+              colour = "black", linewidth = 0.8, se = TRUE) +
+  geom_pointrange(aes(ymin = reactivity_lo, ymax = reactivity_hi), size = 0.7) +
+  scale_colour_manual(values = site_colors) +
+  facet_wrap(~season) +
+  labs(
+    x      = expression(ln(Mass-specific~metabolic~rate)~(J~g^{-1}~day^{-1})),
+    y      = expression(log(lambda[H]^max)~"(reactivity)"),
+    colour = "Site",
+    title  = "Metabolic pace vs. reactivity",
+    subtitle = "Tests whether faster metabolic pace also amplifies disturbances"
+  ) +
+  theme_classic(base_size = 13)
+
+p_met_resilience_ann
+p_met_resilience_seas
+p_met_reactivity
+```
+
+
+```{r}
+# =============================================================================
+# SUMMARY TABLES
+# =============================================================================
+
+# Stability: mean + 95% CI per site x scale x season
+stability_summary <- stability_all %>%
+  group_by(site, scale, season) %>%
+  summarise(
+    resilience_mean  = mean(resilience,              na.rm = TRUE),
+    resilience_lo    = quantile(resilience, 0.025,   na.rm = TRUE),
+    resilience_hi    = quantile(resilience, 0.975,   na.rm = TRUE),
+    reactivity_mean  = mean(reactivity,              na.rm = TRUE),
+    reactivity_lo    = quantile(reactivity, 0.025,   na.rm = TRUE),
+    reactivity_hi    = quantile(reactivity, 0.975,   na.rm = TRUE),
+    prop_stable      = mean(is_stable,               na.rm = TRUE),
+    n_boots          = n(),
+    .groups = "drop"
+  )
+
+# Interaction strengths: distribution summary per site x scale x season
+interaction_summary <- interactions_all %>%
+  group_by(site, scale, season, direction) %>%
+  summarise(
+    mean_abs_strength = mean(abs(interaction_strength), na.rm = TRUE),
+    sd_abs_strength   = sd(abs(interaction_strength),   na.rm = TRUE),
+    median_strength   = median(interaction_strength,    na.rm = TRUE),
+    n_links           = n(),
+    .groups = "drop"
+  )
+
+# Proportion of strong interactions per boot (Bazin threshold: top 0.2% of total flux)
+# Adapt threshold as needed for your system
+strong_flux_threshold <- 0.002  # 0.2% of total flux
+
+strong_flux_summary <- map_dfr(sites, function(s) {
+  map_dfr(c("annual", seasons), function(sc) {
+    
+    fl <- if (sc == "annual") {
+      results[[s]]$annual$flux_list
+    } else {
+      results[[s]]$seasonal[[sc]]$flux_list
+    }
+    if (is.null(fl)) return(NULL)
+    
+    map_dfr(names(fl), function(b) {
+      mat        <- fl[[b]]
+      total_flux <- sum(mat)
+      n_strong   <- sum(mat > strong_flux_threshold * total_flux)
+      n_total    <- sum(mat > 0)
+      tibble(
+        site            = s,
+        scale           = ifelse(sc == "annual", "annual", "seasonal"),
+        season          = ifelse(sc == "annual", NA_character_, sc),
+        boot_id         = b,
+        total_flux_J    = total_flux,
+        n_links         = n_total,
+        n_strong_links  = n_strong,
+        prop_strong     = n_strong / n_total
+      )
+    })
+  })
+})
+
+# Quick checks
+glimpse(stability_summary)
+glimpse(interaction_summary)
+glimpse(strong_flux_summary)
+
+# Access raw objects:
+# results[["hver"]]$annual$flux_list             # raw flux matrices
+# results[["hver"]]$annual$jacobians             # raw Jacobian matrices
+# results[["hver"]]$seasonal$second$stability_summary
+# results[["st6"]]$seasonal$first$interaction_strengths
+
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(forcats)
+
+# ---- helper: ordered label for x-axis ----
+stability_summary <- stability_summary %>%
+  mutate(
+    time_label = case_when(
+      scale == "annual"             ~ "Annual",
+      season == "first"             ~ "Jan–Apr",
+      season == "second"            ~ "May–Aug",
+      season == "third"             ~ "Sep–Dec"
+    ),
+    time_label = factor(time_label, 
+                        levels = c("Annual", "Jan–Apr", "May–Aug", "Sep–Dec"))
+  )
+
+# ---- Plot 1: Resilience (return rate, more negative = more stable) ----
+p_resilience <- ggplot(stability_summary,
+                       aes(x = time_label, y = resilience_mean, colour = site)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_pointrange(aes(ymin = resilience_lo, ymax = resilience_hi),
+                  position = position_dodge(width = 0.5), size = 0.6) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(
+    x = NULL, y = expression(lambda[J]^max ~ "(resilience)"),
+    title = "Resilience across sites and temporal scales",
+    subtitle = "More negative = faster return to equilibrium after perturbation",
+    colour = "Site"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+# ---- Plot 2: Reactivity (log scale due to magnitude) ----
+p_reactivity <- ggplot(stability_summary,
+                       aes(x = time_label, y = reactivity_mean, colour = site)) +
+  geom_pointrange(aes(ymin = reactivity_lo, ymax = reactivity_hi),
+                  position = position_dodge(width = 0.5), size = 0.6) +
+  scale_y_log10(labels = scales::label_scientific()) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(
+    x = NULL, y = expression(lambda[H]^max ~ "(reactivity, log scale)"),
+    title = "Reactivity across sites and temporal scales",
+    subtitle = "Higher = larger transient amplification before return to equilibrium",
+    colour = "Site"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+# ---- Plot 3: Resilience vs Reactivity scatter (stability space) ----
+p_space <- ggplot(stability_summary,
+                  aes(x = resilience_mean, y = log10(reactivity_mean),
+                      colour = site, shape = scale, label = time_label)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(size = 3, show.legend = FALSE) +
+  scale_colour_brewer(palette = "Dark2") +
+  labs(
+    x = expression(lambda[J]^max ~ "(resilience)"),
+    y = expression(log[10](lambda[H]^max) ~ "(reactivity)"),
+    title = "Stability space",
+    subtitle = "Bottom-left = stable AND non-reactive (most stable)",
+    colour = "Site", shape = "Scale"
+  ) +
+  theme_classic(base_size = 13)
+
+p_resilience
+p_reactivity
+p_space
+
+```
+
+
+
+
+```{r}
+
+library(tidyverse)
+
+site_colors <- c(
+  st14 = "#2C7BB6",
+  oh2  = "#5AAE61",
+  st7  = "#A6D96A",
+  st9  = "#FDAE61",
+  st6  = "#F46D43",
+  hver = "#D73027"
+)
+
+# Summarise: total community biomass per site x date x boot
+# (sum across taxa within each bootstrap replicate, then summarise boots)
+community_biomass <- community %>%
+  filter(!taxon_id %in% basal_taxa) %>%        # exclude placeholder basal rows
+  group_by(site, date_id, boot_id) %>%
+  summarise(total_bio_g_m = sum(bio_g_m, na.rm = TRUE), .groups = "drop") %>%
+  group_by(site, date_id) %>%
+  summarise(
+    mean_bio  = mean(total_bio_g_m, na.rm = TRUE),
+    lo_bio    = quantile(total_bio_g_m, 0.025, na.rm = TRUE),
+    hi_bio    = quantile(total_bio_g_m, 0.975, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  mutate(
+    doy  = yday(date_id),                       # day of year strips the actual year
+    site = factor(site,
+                  levels = c("st14", "oh2", "st7", "st9", "st6", "hver"))
+  )
+
+# Month breaks for x-axis
+month_breaks <- yday(as.Date(paste0("2011-", 1:12, "-01")))
+month_labels <- month.abb
+
+p <- ggplot(community_biomass, aes(x = doy, y = mean_bio, colour = site, fill = site)) +
+  geom_ribbon(aes(ymin = lo_bio, ymax = hi_bio), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.8) +
+  scale_colour_manual(values = site_colors) +
+  scale_fill_manual(values = site_colors) +
+  scale_x_continuous(
+    breaks = month_breaks,
+    labels = month_labels,
+    limits = c(1, 365)
+  ) +
+  scale_y_log10(labels = scales::label_comma()) +
+  labs(
+    x      = NULL,
+    y      = expression("Total community biomass (g m"^{-2}*")"),
+    colour = "Site (cold → warm)",
+    fill   = "Site (cold → warm)",
+    caption = "Shaded bands = 95% bootstrap CI"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position   = "none",
+    axis.text.x       = element_text(size = 10),
+    plot.caption      = element_text(size = 9, colour = "grey50", hjust = 0)
+  )
+
+p
+
+# Save tiff
+ggsave(
+  filename    = "figures/seasonal_bio_nolegend.tiff",
+  plot        = p,
+  width       = 8,
+  height      = 4.5,
+  units       = "in",
+  dpi         = 300,
+  compression = "lzw"
+)
+
+```
+
+
+### van Althena et al. 2015 - even distributions of interactions confer stability 
+G = 0: all links carry equal flux / equal interaction strength
+G = 1: one link carries all the flux / one interaction dominates completely
+
+van Althena major Results:
+G_F ranges 0.86–0.97 across 15 real soil food webs — all highly skewed, few strong fluxes dominate
+G_F and G_I are positively correlated (ρ = 0.58) — skewed fluxes produce skewed interactions
+Both G_F and G_I are positively correlated with instability (ρ = 0.78 and 0.60) — more skewed distributions → less stable webs
+
+```{r}
+
+# Gini function (Sen 1973 definition, matches van Altena eq. 7-8)
+gini <- function(x) {
+  x <- abs(x[is.finite(x) & x != 0])
+  if (length(x) < 2) return(NA_real_)
+  n  <- length(x)
+  mu <- mean(x)
+  sum(abs(outer(x, x, "-"))) / (2 * n^2 * mu)
+}
+
+# G_F: Gini of flux distributions, per boot
+# 
+gini_flux <- map_dfr(sites, function(s) {
+  map_dfr(c("annual", seasons), function(sc) {
+    
+    fl <- if (sc == "annual") results[[s]]$annual$flux_list
+          else results[[s]]$seasonal[[sc]]$flux_list
+    if (is.null(fl)) return(NULL)
+    
+    map_dfr(names(fl), function(b) {
+      tibble(
+        site    = s,
+        scale   = ifelse(sc == "annual", "annual", "seasonal"),
+        season  = ifelse(sc == "annual", NA_character_, sc),
+        boot_id = b,
+        G_F     = gini(as.vector(fl[[b]]))
+      )
+    })
+  })
+})
+
+# G_I: Gini of off-diagonal |J_ij|, but only consumer-resource interactions
+gini_interactions <- interactions_real %>%
+  group_by(site, scale, season, boot_id) %>%
+  summarise(G_I = gini(interaction_strength), .groups = "drop")
+
+# Join and summarise
+gini_summary <- left_join(
+  gini_flux,
+  gini_interactions,
+  by = c("site", "scale", "season", "boot_id")
+) %>%
+  group_by(site, scale, season) %>%
+  summarise(
+    G_F_mean = mean(G_F, na.rm = TRUE),
+    G_F_lo   = quantile(G_F, 0.025, na.rm = TRUE),
+    G_F_hi   = quantile(G_F, 0.975, na.rm = TRUE),
+    G_I_mean = mean(G_I, na.rm = TRUE),
+    G_I_lo   = quantile(G_I, 0.025, na.rm = TRUE),
+    G_I_hi   = quantile(G_I, 0.975, na.rm = TRUE),
+    .groups  = "drop"
+  ) %>%
+  mutate(
+    site = factor(site, levels = c("st14","oh2","st7","st9","st6","hver")),
+    time_label = case_when(
+      scale == "annual" ~ "Annual",
+      season == "first" ~ "Jan–Apr",
+      season == "second" ~ "May–Aug",
+      season == "third" ~ "Sep–Dec"
+    ) %>% factor(levels = c("Annual","Jan–Apr","May–Aug","Sep–Dec"))
+  )
+```
+Results: G_F range from 0.81-0.94, G_I range from 0.63-0.83.
+
+# Visualizing the skew of fluxes and interaction strengths 
+
+```{r}
+site_order  <- c("st14","oh2","st7","st9","st6","hver")
+site_colors <- c(st14="#2C7BB6", oh2="#5AAE61", st7="#A6D96A",
+                 st9="#FDAE61", st6="#F46D43", hver="#D73027")
+
+# ── Plot 1: Annual G_F and G_I across the thermal gradient ──────────────────
+# The primary cross-site comparison — most interpretable panel
+# Faceted so G_F and G_I sit side by side on the same scale
+
+gini_annual <- gini_summary %>% filter(scale == "annual")
+gini_seasonal <- gini_summary %>% filter(scale == "seasonal")
+
+p_annual <- gini_annual %>%
+  select(site, G_F_mean, G_F_lo, G_F_hi, G_I_mean, G_I_lo, G_I_hi) %>%
+  pivot_longer(
+    cols      = -site,
+    names_to  = c("metric", ".value"),
+    names_pattern = "(G_F|G_I)_(mean|lo|hi)"
+  ) %>%
+  mutate(metric = recode(metric,
+                         G_F = "GF (flux)",
+                         G_I = "GI (interaction strength)")) %>%
+  ggplot(aes(x = site, y = mean, color = site)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), size = 0.7) +
+  scale_color_manual(values = site_colors) +
+  scale_y_continuous(limits = c(0.6, 1.0), breaks = seq(0.6, 1.0, 0.1)) +
+  facet_wrap(~metric) +
+  labs(x = "Site", y = "Gini coefficient",
+       title = "Interaction inequality across the thermal gradient",
+       subtitle = "G = 0: all links carry equal flux / equal interaction strength
+G = 1: one link carries all the flux / one interaction dominates completely",
+       color = "Site") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+
+
+p_seasonal <- gini_seasonal %>%
+  ggplot(aes(x = time_label, y = G_F_mean, color = site)) +
+  geom_pointrange(aes(ymin = G_F_lo, ymax = G_F_hi), size = 0.7) +
+  scale_color_manual(values = site_colors) +
+  scale_y_continuous(limits = c(0.6, 1.0), breaks = seq(0.6, 1.0, 0.1)) +
+  labs(x = "Season", y = "Gini coefficient",
+       title = "Flux inequality across the thermal gradient",
+       subtitle = "G = 0: all links carry equal flux
+G = 1: one link carries all the flux",
+       color = "Site") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+
+
+pd <- position_dodge(width = 0.4)
+
+# G_F version
+p_seasonal_GF <- gini_summary %>%
+  filter(scale == "seasonal") %>%
+  mutate(site = factor(site, levels = site_order)) %>%
+  ggplot(aes(x = time_label, y = G_F_mean, 
+             color = site, group = site)) +
+  geom_line(aes(group = site), position = pd, 
+            linewidth = 0.6, alpha = 0.5) +
+  geom_pointrange(aes(ymin = G_F_lo, ymax = G_F_hi),
+                  position = pd, size = 0.6) +
+  scale_color_manual(values = site_colors) +
+  scale_y_continuous(limits = c(0.6, 1.0), breaks = seq(0.6, 1.0, 0.1)) +
+  labs(x = "Season", 
+       y = expression(G[F]),
+       title = "Flux inequality across seasons",
+       subtitle = "G = 0: all links equal  |  G = 1: one link dominates",
+       color = "Site") +
+  theme_classic(base_size = 13)
+
+# G_I version — identical but swap G_F → G_I
+p_seasonal_GI <- gini_summary %>%
+  filter(scale == "seasonal") %>%
+  mutate(site = factor(site, levels = site_order)) %>%
+  ggplot(aes(x = time_label, y = G_I_mean,
+             color = site, group = site)) +
+  geom_line(aes(group = site), position = pd,
+            linewidth = 0.6, alpha = 0.5) +
+  geom_pointrange(aes(ymin = G_I_lo, ymax = G_I_hi),
+                  position = pd, size = 0.6) +
+  scale_color_manual(values = site_colors) +
+  scale_y_continuous(limits = c(0.6, 1.0), breaks = seq(0.6, 1.0, 0.1)) +
+  labs(x = "Season",
+       y = expression(G[I]),
+       title = "Interaction strength inequality across seasons",
+       subtitle = "G = 0: all interactions equal  |  G = 1: one interaction dominates",
+       color = "Site") +
+  theme_classic(base_size = 13)
+
+# Combined — shared legend on right
+p_seasonal_GF + p_seasonal_GI + 
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+
+
+# p_annual_GF
+p_annual_GF <- gini_summary %>%
+  filter(scale == "annual") %>%
+  mutate(site = factor(site, levels = site_order)) %>%
+  ggplot(aes(x = site, y = G_F_mean, color = site)) +
+  annotate("rect", xmin = -Inf, xmax = Inf,
+           ymin = 0.86, ymax = 0.97,
+           alpha = 0.08, fill = "grey30") +
+  geom_pointrange(aes(ymin = G_F_lo, ymax = G_F_hi), size = 0.7) +
+  scale_color_manual(values = site_colors) +
+  scale_y_continuous(limits = c(0.6, 1.0), breaks = seq(0.6, 1.0, 0.1)) +
+  labs(x = "Site (cold → warm)", 
+       y = expression(G[F]),
+       title = "Annual flux inequality",
+       subtitle = "Grey = van Altena range (0.86–0.97)",
+       color = "Site") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+
+# p_annual_GI
+p_annual_GI <- gini_summary %>%
+  filter(scale == "annual") %>%
+  mutate(site = factor(site, levels = site_order)) %>%
+  ggplot(aes(x = site, y = G_I_mean, color = site)) +
+  annotate("rect", xmin = -Inf, xmax = Inf,
+           ymin = 0.64, ymax = 0.86,
+           alpha = 0.08, fill = "grey30") +
+  geom_pointrange(aes(ymin = G_I_lo, ymax = G_I_hi), size = 0.7) +
+  scale_color_manual(values = site_colors) +
+  scale_y_continuous(limits = c(0.6, 1.0), breaks = seq(0.6, 1.0, 0.1)) +
+  labs(x = "Site (cold → warm)", 
+       y = expression(G[I]),
+       title = "Annual interaction strength inequality",
+       subtitle = "Grey = van Altena range (0.64–0.86)",
+       color = "Site") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+
+# 4-panel layout
+Gini <- (p_seasonal_GF | p_annual_GF) / (p_seasonal_GI | p_annual_GI) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+
+
+# Save tiff
+ggsave(
+  filename    = "figures/Gini.tiff",
+  plot        = Gini,
+  width       = 8,
+  height      = 4.5,
+  units       = "in",
+  dpi         = 300,
+  compression = "lzw"  
+)
+
+ggsave(
+  filename = "figures/Gini.pdf",
+  plot     = Gini,
+  width    = 12,
+  height   = 9,
+  units    = "in"
+)
+```
+
+
+
+

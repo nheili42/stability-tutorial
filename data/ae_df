@@ -1,0 +1,202 @@
+"site","taxon_id","ae"
+"hver","Cricotopus sylvestris",0.906
+"hver","Hirudinidae",0.906
+"hver","Limnophora riparia",0.906
+"hver","Lumbricidae",0.906
+"hver","Midge indet.",0.906
+"hver","Naidid",0.906
+"hver","Nais spp.",0.906
+"hver","Nematoda",0.906
+"hver","Oribatid",0.906
+"hver","Ostracoda",0.906
+"hver","Radix balthica",0.906
+"hver","Simulium vittatum",0.906
+"hver","Sperchon glandulosus",0.906
+"hver","Thysanoptera",0.906
+"hver","amorphous_detritus",0.158
+"hver","animal",0.906
+"hver","cyanobacteria",0.545
+"hver","diatom",0.545
+"hver","filamentous",0.545
+"hver","green_algae",0.545
+"hver","plant_material",0.545
+"oh2","Capnia vidua",0.906
+"oh2","Ceratopegonid",0.906
+"oh2","Chaetocladius",0.906
+"oh2","Clinocera stagnalis",0.906
+"oh2","Collembola",0.906
+"oh2","Copepoda",0.906
+"oh2","Diamesa bertrami",0.906
+"oh2","Diamesa bohemani_zernyi",0.906
+"oh2","Dicranota",0.906
+"oh2","Dytiscidae Larva",0.906
+"oh2","Eukiefferiella sp.",0.906
+"oh2","Limnophora riparia",0.906
+"oh2","Limnophyes",0.906
+"oh2","Limonia",0.906
+"oh2","Lumbricidae",0.906
+"oh2","Macropelopia",0.906
+"oh2","Metriocnemus",0.906
+"oh2","Micropsectra sp.",0.906
+"oh2","Nematoda",0.906
+"oh2","Orthocladius frigidus",0.906
+"oh2","Orthocladius oblidens",0.906
+"oh2","Ostracoda",0.906
+"oh2","Parochlus",0.906
+"oh2","Potamophylax cingulatus",0.906
+"oh2","Radix balthica",0.906
+"oh2","Rheocricotopus effusus",0.906
+"oh2","Simulium vernum",0.906
+"oh2","Simulium vittatum",0.906
+"oh2","Sperchon glandulosus",0.906
+"oh2","Thienemanniella sp.",0.906
+"oh2","Tipula",0.906
+"oh2","amorphous_detritus",0.158
+"oh2","animal",0.906
+"oh2","cyanobacteria",0.545
+"oh2","diatom",0.545
+"oh2","filamentous",0.545
+"oh2","green_algae",0.545
+"oh2","plant_material",0.545
+"st14","Antocha sp.",0.906
+"st14","Ceratopegonid",0.906
+"st14","Copepoda",0.906
+"st14","Diamesa",0.906
+"st14","Eukiefferiella sp.",0.906
+"st14","Hydracarina",0.906
+"st14","Limnophora riparia",0.906
+"st14","Lumbricidae",0.906
+"st14","Micropsectra sp.",0.906
+"st14","Naidid",0.906
+"st14","Nematoda",0.906
+"st14","Oribatid",0.906
+"st14","Orthocladius frigidus",0.906
+"st14","Ostracoda",0.906
+"st14","Potamophylax cingulatus",0.906
+"st14","Prosimulium ursinum",0.906
+"st14","Radix balthica",0.906
+"st14","Rheocricotopus effusus",0.906
+"st14","Simulium aureum",0.906
+"st14","Simulium vernum",0.906
+"st14","Simulium vittatum",0.906
+"st14","Sperchon glandulosus",0.906
+"st14","Thienemanniella sp.",0.906
+"st14","Thysanoptera",0.906
+"st14","amorphous_detritus",0.158
+"st14","animal",0.906
+"st14","cyanobacteria",0.545
+"st14","diatom",0.545
+"st14","filamentous",0.545
+"st14","green_algae",0.545
+"st14","plant_material",0.545
+"st6","Antocha sp.",0.906
+"st6","Chaetocladius dentiforceps",0.906
+"st6","Copepoda",0.906
+"st6","Corynoneura sp.",0.906
+"st6","Cricotopus sylvestris",0.906
+"st6","Diamesa bertrami",0.906
+"st6","Ephydridae sp.",0.906
+"st6","Eukiefferiella sp.",0.906
+"st6","Galba trunculata",0.906
+"st6","Limnophora riparia",0.906
+"st6","Lumbricidae",0.906
+"st6","Macropelopia",0.906
+"st6","Micropsectra sp.",0.906
+"st6","Midge indet.",0.906
+"st6","Naidid",0.906
+"st6","Nais spp.",0.906
+"st6","Nematoda",0.906
+"st6","Oribatid",0.906
+"st6","Orthocladius",0.906
+"st6","Orthocladius oblidens",0.906
+"st6","Ostracoda",0.906
+"st6","Potamophylax cingulatus",0.906
+"st6","Radix balthica",0.906
+"st6","Rheocricotopus effusus",0.906
+"st6","Simulium vittatum",0.906
+"st6","Sperchon glandulosus",0.906
+"st6","Thienemanniella sp.",0.906
+"st6","amorphous_detritus",0.158
+"st6","animal",0.906
+"st6","cyanobacteria",0.545
+"st6","diatom",0.545
+"st6","filamentous",0.545
+"st6","green_algae",0.545
+"st6","plant_material",0.545
+"st7","Capnia vidua",0.906
+"st7","Ceratopegonid",0.906
+"st7","Chaetocladius",0.906
+"st7","Clinocera stagnalis",0.906
+"st7","Collembola",0.906
+"st7","Copepoda",0.906
+"st7","Diamesa bertrami",0.906
+"st7","Diamesa bohemani_zernyi",0.906
+"st7","Dicranota",0.906
+"st7","Eukiefferiella sp.",0.906
+"st7","Limnophora riparia",0.906
+"st7","Limnophyes",0.906
+"st7","Limonia",0.906
+"st7","Lumbricidae",0.906
+"st7","Macropelopia",0.906
+"st7","Metriocnemus",0.906
+"st7","Micropsectra sp.",0.906
+"st7","Nematoda",0.906
+"st7","Orthocladius frigidus",0.906
+"st7","Ostracoda",0.906
+"st7","Parochlus",0.906
+"st7","Potamophylax cingulatus",0.906
+"st7","Prosimulium ursinum",0.906
+"st7","Radix balthica",0.906
+"st7","Rheocricotopus effusus",0.906
+"st7","Simulium vernum",0.906
+"st7","Simulium vittatum",0.906
+"st7","Sperchon glandulosus",0.906
+"st7","Thaumaleidae",0.906
+"st7","Thienemanniella sp.",0.906
+"st7","Tipula",0.906
+"st7","amorphous_detritus",0.158
+"st7","animal",0.906
+"st7","cyanobacteria",0.545
+"st7","diatom",0.545
+"st7","filamentous",0.545
+"st7","green_algae",0.545
+"st7","plant_material",0.545
+"st9","Antocha sp.",0.906
+"st9","Ceratopegonid",0.906
+"st9","Clinocera stagnalis",0.906
+"st9","Copepoda",0.906
+"st9","Diamesa bohemani_zernyi",0.906
+"st9","Eukiefferiella sp.",0.906
+"st9","Hydra",0.906
+"st9","Limnophora riparia",0.906
+"st9","Lumbricidae",0.906
+"st9","Macropelopia",0.906
+"st9","Micropsectra sp.",0.906
+"st9","Midge indet.",0.906
+"st9","Naidid",0.906
+"st9","Nais spp.",0.906
+"st9","Oribatid",0.906
+"st9","Orthocladius frigidus",0.906
+"st9","Orthocladius oblidens",0.906
+"st9","Orthocladius spp.",0.906
+"st9","Ostracoda",0.906
+"st9","Parochlus sp.",0.906
+"st9","Potamophylax cingulatus",0.906
+"st9","Prosimulium ursinum",0.906
+"st9","Radix balthica",0.906
+"st9","Rheocricotopus effusus",0.906
+"st9","Simulium aureum",0.906
+"st9","Simulium spp.",0.906
+"st9","Simulium vernum",0.906
+"st9","Simulium vittatum",0.906
+"st9","Sperchon glandulosus",0.906
+"st9","Thaumaleidae",0.906
+"st9","Thienemanniella sp.",0.906
+"st9","Thysanoptera",0.906
+"st9","amorphous_detritus",0.158
+"st9","animal",0.906
+"st9","cyanobacteria",0.545
+"st9","diatom",0.545
+"st9","filamentous",0.545
+"st9","green_algae",0.545
+"st9","plant_material",0.545

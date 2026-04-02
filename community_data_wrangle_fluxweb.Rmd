@@ -1,0 +1,234 @@
+---
+title: "community_df_fluxwebs"
+author: "Nate Heili"
+date: "2026-03-08"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r libraries}
+# Clean environemnt 
+rm(list = ls())
+
+# load packages
+library(tidyverse)
+library(readr)
+
+```
+
+## Data wrangle
+
+Get data in form to estimate fluxes
+
+```{r biomass}
+# Create local data folder
+dir.create("data", showWarnings = FALSE)
+
+# Community structure / production
+url <- "https://github.com/nheili42/stability-tutorial/raw/main/data/prod_full_fin.rds"
+dest <- "data/prod_full_fin.rds"
+download.file(url, dest, mode = "wb")
+prod_full_fin <- readRDS(dest)
+
+# Lumping or spelling changes for community data
+name_cleaner <- tribble(
+  ~old_name, ~final_name,
+  "Lumb 3", "Lumbricidae",
+  "Oligochaeta A", "Lumbricidae",
+  "Oligochaeta B", "Lumbricidae",
+  "Oligochaeta C", "Lumbricidae",
+  "Naidid 1", "Naidid",
+  "Naidid 2", "Naidid",
+  "Tub. 2", "Naidid",
+  "Tubificid 1", "Naidid",
+  "Nais spp.", "Naidid",
+  "Ceratopogonidae A", "Ceratopegonid",
+  "Ceratopogonidae B", "Ceratopegonid",
+  "Eukiefferiella", "Eukiefferiella sp.",
+  " Eukiefferiella", "Eukiefferiella sp.",
+  "Eukiefferiella claripennis", "Eukiefferiella sp.",
+  "Eukiefferiella minor", "Eukiefferiella sp.",
+  "Orthocladius fridgidus", "Orthocladius frigidus",
+  "S. vernum pupa", "Simulium vernum",
+  "S. vitattum pupa", "Simulium vittatum",
+  "Oribatid 1", "Oribatid",
+  "Oribatid 2", "Oribatid",
+  "Oribatid 3", "Oribatid",
+  "Midge indet.", "Chironomidae",
+  
+)
+
+name_lookup <- setNames(name_cleaner$final_name, name_cleaner$old_name)
+
+prod_full_fin_clean <- prod_full_fin %>%
+  map(~ map(.x, ~ .x %>%
+    mutate(taxon_id = recode(taxon_id, !!!name_lookup))
+  ))
+
+
+# Bootstrap estimates of consumer densities (ind/m2) on a given date
+abundance_full <- map_dfr(
+  prod_full_fin_clean,
+  ~ .x[["Nintboots.full"]],
+  .id = "site"
+)
+
+# Bootstrap estimates of consumer biomass (mg/m2) on a given date
+bio_full <- map_dfr(
+  prod_full_fin_clean,
+  ~ .x[["Bintboots.full"]],
+  .id = "site"
+)
+
+community <- bind_cols(
+  bio_full |> select(-site_id),
+  abundance_full |> select(n_ind_m)
+)
+
+community <- community %>%
+  mutate(bio_g_m = bio_mg_m/1000,
+         ind_g = bio_g_m / n_ind_m)
+
+# Add basal resources to the community dataframe. Need these for fluxing to match the trophic interaction matrix.
+basal_taxa <- c(
+  "amorphous_detritus",
+  "animal",
+  "cyanobacteria",
+  "diatom",
+  "filamentous",
+  "green_algae",
+  "plant_material"
+)
+
+# Get all unique combinations of site, date, boot_id
+site_date_boot <- community |> 
+  distinct(site, date_id, boot_id)
+
+# Create basal resource rows
+basal_rows <- crossing(site_date_boot, taxon_id = basal_taxa) |>
+  mutate(
+    bio_mg_m = 0,
+    n_ind_m = 0,
+    bio_g_m = 0,
+    ind_g = 0
+  )
+
+# Append to community
+community <- bind_rows(community, basal_rows)
+
+
+# Add env temp to df 
+temp <- read.csv('data/stream_temps_full.csv')
+
+community <- community |>
+  left_join(
+    temp |> select(site, DATE, kelvin, celcius),
+    by = c("site" = "site", "date_id" = "DATE")
+  )
+```
+
+Metabolic losses column 
+
+```{r}
+# Define parameters for equation
+boltz <- 0.00008617343 # Boltzmann constant (eV/Kelvin)
+E <- 0.69 # activation energy (eV)
+b <- 0.71 # scaling exponent for invertebrates from MTE (dimensionless)
+ln_i <- 17.17 # normalization constant (intercept) for invertebrates from MTE (intercept in log space, representing met rate of 1g organism at an infinte temp - ln(W/1gram))
+
+# Estimate per-capita metabolic rate for each taxon based on individual body mass (g ind-1) and average annual stream temperature
+community$metrate_J_sec_ind <- exp((b * log(community$ind_g) + ln_i) - (E/(boltz*(community$kelvin))))
+
+community$metrate_J_day_ind <- community$metrate_J_sec_ind * 86400 #number of seconds in a day
+
+# Calculate mass-specific loss (J day-1 gram-1)
+community$metrate_J_day_gram <- community$metrate_J_day_ind/community$ind_g
+
+# Replace NA with 0 for basal resources
+community[sapply(community, is.nan)] <- 0
+
+```
+
+Temp dependent assimilation efficiency (Lang et al. 2017) 
+```{r AE}
+# Parameters from Lang et al. 2017
+Ee <- 0.164        # activation energy for AE (eV) - shared across consumer types
+T0 <- 293.15       # reference temperature (20°C in Kelvin)
+boltz <- 0.00008617343  # Boltzmann constant (eV/K)
+
+# Assign consumer type and base AE (intercept at 20°C, 1g)
+# Base AE values are already in logit space internally via the logistic model
+community <- community |>
+  mutate(
+    # Assign consumer type for AE calculation
+    consumer_type = case_when(
+      taxon_id == "amorphous_detritus" ~ "detritivore",
+      taxon_id %in% c("plant_material", "green_algae", "filamentous", 
+                       "diatom", "cyanobacteria") ~ "herbivore",
+      TRUE ~ "carnivore"
+    ),
+    
+    # Base AE at 20°C (ε0 values from Lang et al. 2017 Table results)
+    ae_base = case_when(
+      consumer_type == "detritivore" ~ 0.158,
+      consumer_type == "herbivore"   ~ 0.545,
+      consumer_type == "carnivore"   ~ 0.906
+    ),
+    
+    # Logit-transform base AE to get ε̂0 (the normalization constant in logit space)
+    logit_ae0 = log(ae_base / (1 - ae_base)),
+    
+    # Apply temperature correction using logistic model (Eq. 2, Lang et al. 2017)
+    # Arrhenius term centered on T0 = 20°C
+    arrhenius_term = Ee * (kelvin - T0) / (boltz * kelvin * T0),
+    
+    # Calculate temperature-dependent AE (back-transform from logit)
+    ae_temp = exp(logit_ae0 + arrhenius_term) / 
+              (1 + exp(logit_ae0 + arrhenius_term))
+  )
+
+# Check the range of AE based on temp and prey type
+community |> 
+  group_by(consumer_type) |> 
+  summarise(
+    ae_base = first(ae_base),
+    ae_temp_min = min(ae_temp, na.rm = TRUE),
+    ae_temp_max = max(ae_temp, na.rm = TRUE)
+  )
+
+
+#saveRDS(community, "data/community.rds")
+```
+
+```{r}
+# Discrepancy in the diet and community df for st6
+
+# Load diet data locally (also found on Github)
+diet <- readRDS("data/diet_matrices_clean.rds")
+
+# rename function
+rename_taxon <- function(mat, old, new) {
+  rownames(mat)[rownames(mat) == old] <- new
+  colnames(mat)[colnames(mat) == old] <- new
+  mat
+}
+
+# change in annual matrix
+diet[["st6"]][["annual"]] <- rename_taxon(diet[["st6"]][["annual"]],
+                                          "Orthocladius frigidus", "Orthocladius")
+
+# change in seasonal matrix
+diet[["st6"]][["season_means"]] <- lapply(diet[["st6"]][["season_means"]], rename_taxon,
+                                          old = "Orthocladius frigidus", new = "Orthocladius")
+
+
+
+
+#saveRDS(diet, "data/diet_matrices_clean.rds")
+
+```
+
