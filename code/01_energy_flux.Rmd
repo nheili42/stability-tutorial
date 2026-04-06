@@ -1,0 +1,703 @@
+---
+title: "01 — Bootstrapped Energy Flux Estimation"
+author: "Nate Heili"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+This script estimates bootstrapped energy fluxes through the food web for each
+**sampling date** across six Icelandic streams spanning a broad thermal gradient
+(~5–30°C). Running fluxes at the date level preserves the full temporal
+resolution of the biomass data; seasonal and annual summaries are derived
+downstream rather than by pre-averaging biomasses.
+
+**Diet matrix assignment:** Because gut content analysis was conducted
+seasonally (first = Jan–Apr, second = May–Aug, third = Sep–Dec), each sampling
+date is assigned the diet matrix for the season it falls within.
+
+**Inputs:**
+- `data/community.rds` — bootstrapped biomass (from Junker et al. 2024), allometric temp-dependent metabolic rates (from MTE and Gauzens et al. 2017), temp-dependent AE per resource (following Lang et al. 2017), site, date, and boot_id (produced by `00_data_prep.Rmd`) - `data/diet_matrices_clean.rds` — seasonal and annual diet matrices per site.
+
+**Outputs:**
+- `data/processed/results_flux.rds` — raw flux matrices per site × date × boot
+- `data/processed/flux_long.rds` — tidy long-form flux summary for plotting
+- `data/processed/flux_summary.rds` — median + CI of total flux per site × date
+
+---
+
+# Libraries
+
+```{r libraries}
+rm(list = ls())
+
+library(fluxweb)
+library(tidyverse)
+library(lubridate)
+```
+
+---
+
+# Load data
+
+```{r load-data}
+community <- readRDS("data/community.rds")
+diet      <- readRDS("data/diet_matrices_clean.rds")
+```
+
+---
+
+# Constants
+
+```{r constants}
+# Basal resources: zero consumer biomass, need placeholder handling
+basal_taxa <- c("amorphous_detritus", "animal", "cyanobacteria",
+                "diatom", "filamentous", "green_algae", "plant_material")
+
+# Season bins match GCA sampling windows
+# These determine which seasonal diet matrix is applied to each date
+season_breaks <- list(
+  first  = 1:4,    # Jan–Apr
+  second = 5:8,    # May–Aug
+  third  = 9:12    # Sep–Dec
+)
+
+# Assign season label to each row in community df
+community <- community %>%
+  mutate(
+    date_id = as_date(date_id),
+    season  = case_when(
+      month(date_id) %in% season_breaks$first  ~ "first",
+      month(date_id) %in% season_breaks$second ~ "second",
+      month(date_id) %in% season_breaks$third  ~ "third"
+    )
+  )
+
+# Site order cold to warm and color code for all plotting
+site_order  <- c("st14", "oh2", "st7", "st9", "st6", "hver")
+site_colors <- c(
+  st14 = "#2C7BB6",
+  oh2  = "#5AAE61",
+  st7  = "#A6D96A",
+  st9  = "#FDAE61",
+  st6  = "#F46D43",
+  hver = "#D73027"
+)
+```
+
+---
+
+# Helper functions
+
+## `assign_diet()`
+
+Returns the correct seasonal diet matrix for a given site and sampling date.
+Falls back to the annual matrix if a seasonal matrix is missing (e.g., some
+sites lack a third-season GCA sample).
+
+```{r fn-assign-diet}
+assign_diet <- function(diet_list, site_name, date_val) {
+  
+  seas <- case_when(
+    month(date_val) %in% season_breaks$first  ~ "first",
+    month(date_val) %in% season_breaks$second ~ "second",
+    month(date_val) %in% season_breaks$third  ~ "third"
+  )
+  
+  mat <- diet_list[[site_name]][["season_means"]][[seas]]
+  
+  # Fall back to annual if seasonal matrix is absent
+  if (is.null(mat)) {
+    warning(paste("No", seas, "diet matrix for", site_name,
+                  "— falling back to annual matrix"))
+    mat <- diet_list[[site_name]][["annual"]]
+  }
+  
+  list(matrix = mat, season = seas)
+}
+```
+
+## `prep_community_date()`
+
+Filters the community dataframe to a single site × date, then:
+
+1. Checks all taxa in the diet matrix are present
+2. Computes per-taxon placeholder biomass and metabolic rate (1% of observed
+   minimum) so that zero-biomass taxa (primarily basal resources) don't
+   cause `fluxing()` to fail
+3. Returns a tidy dataframe ready to loop over boot_ids
+
+```{r fn-prep-community}
+prep_community_date <- function(community_df, site_name, date_val, diet_mat) {
+  
+  sp_order <- rownames(diet_mat)
+  
+  df <- community_df %>%
+    filter(site == site_name, date_id == date_val)
+  
+  if (nrow(df) == 0) return(NULL)
+  
+  if (!all(sp_order %in% unique(df$taxon_id))) {
+    missing <- setdiff(sp_order, unique(df$taxon_id))
+    warning(paste("Missing taxa at", site_name, as.character(date_val), ":",
+                  paste(missing, collapse = ", ")))
+    return(NULL)
+  }
+  
+  # Aggregate to one row per boot × taxon
+  # Necessary because some taxa may have multiple rows per date
+  # (e.g., multiple size classes or sub-date sampling occasions)
+  df <- df %>%
+    group_by(boot_id, taxon_id) %>%
+    summarise(
+      bio_g_m            = mean(bio_g_m,            na.rm = TRUE),
+      metrate_J_day_gram = mean(metrate_J_day_gram,  na.rm = TRUE),
+      ae_temp            = mean(ae_temp,             na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # --- Placeholder values for zero/NA biomass (basal resources) ---
+  global_min_bio  <- df %>% filter(bio_g_m > 0) %>%
+                       pull(bio_g_m) %>% min(na.rm = TRUE)
+  global_min_loss <- df %>% filter(metrate_J_day_gram > 0) %>%
+                       pull(metrate_J_day_gram) %>% min(na.rm = TRUE)
+  
+  placeholders <- df %>%
+    filter(bio_g_m > 0, metrate_J_day_gram > 0) %>%
+    group_by(taxon_id) %>%
+    summarise(
+      ph_bio  = min(bio_g_m,            na.rm = TRUE) * 0.01,
+      ph_loss = min(metrate_J_day_gram,  na.rm = TRUE) * 0.01,
+      .groups = "drop"
+    )
+  
+  all_taxa <- tibble(taxon_id = sp_order) %>%
+    left_join(placeholders, by = "taxon_id") %>%
+    mutate(
+      ph_bio  = coalesce(ph_bio,  global_min_bio  * 0.01),
+      ph_loss = coalesce(ph_loss, global_min_loss * 0.01)
+    )
+  
+  df %>%
+    left_join(all_taxa, by = "taxon_id") %>%
+    mutate(
+      bio_g_m            = if_else(is.na(bio_g_m) | bio_g_m == 0,
+                                   ph_bio,  bio_g_m),
+      metrate_J_day_gram = if_else(is.na(metrate_J_day_gram) | metrate_J_day_gram == 0,
+                                   ph_loss, metrate_J_day_gram)
+    ) %>%
+    select(-ph_bio, -ph_loss)
+}
+```
+
+## `run_fluxes_date()`
+
+Iterates over all bootstrap replicates for one prepped site × date community
+and returns a named list of flux matrices — one matrix per boot.
+
+```{r fn-run-fluxes}
+run_fluxes_date <- function(community_prepped, diet_mat) {
+  
+  sp_order <- rownames(diet_mat)
+  boot_ids <- sort(unique(community_prepped$boot_id))
+  
+  flux_list <- lapply(boot_ids, function(b) {
+    
+    df_b <- community_prepped %>%
+      filter(boot_id == b) %>%
+      arrange(match(taxon_id, sp_order))
+    
+    # Safety checks before calling fluxing()
+    if (nrow(df_b) != nrow(diet_mat)) {
+      warning(paste("Boot", b, "— row count mismatch, skipping"))
+      return(NULL)
+    }
+    if (!all(df_b$taxon_id == sp_order)) {
+      warning(paste("Boot", b, "— taxon order mismatch, skipping"))
+      return(NULL)
+    }
+    
+    tryCatch(
+      fluxing(
+        mat          = diet_mat,
+        biomasses    = df_b$bio_g_m,
+        losses       = df_b$metrate_J_day_gram,
+        efficiencies = df_b$ae_temp,
+        bioms.prefs  = FALSE,  # GCA proportions used as-is; not overridden by biomass
+        bioms.losses = TRUE,   # metabolic loss per gram, scaled internally to population
+        ef.level     = "prey"  # AE is a property of the prey item (basal resource)
+      ),
+      error = function(e) {
+        warning(paste("Boot", b, "fluxing() error:", e$message))
+        NULL
+      }
+    )
+  })
+  
+  names(flux_list) <- boot_ids
+  Filter(Negate(is.null), flux_list)
+}
+```
+
+---
+
+# Main loop: flux estimation across all sites × dates × boots
+
+This loop produces `results_flux` — a nested list structured as:
+
+```
+results_flux
+  └── site (e.g. "st14")
+        └── date (e.g. "2011-03-15")
+              ├── flux_list   — named list of flux matrices (one per boot)
+              ├── season      — "first" | "second" | "third"
+              ├── site        — site name
+              └── date        — Date object
+```
+
+Flux matrices have units of **J m-2 day-1** and are structured as prey (rows) × consumer (columns), matching the diet matrix orientation.
+
+```{r main-loop}
+# Get all unique sampling dates per site
+site_dates <- community %>%
+  filter(!taxon_id %in% basal_taxa) %>%   # dates defined by consumer sampling
+  distinct(site, date_id) %>%
+  arrange(site, date_id)
+
+message("Total site × date combinations to process: ", nrow(site_dates))
+
+results_flux <- map(sites, function(s) {
+  
+  message("\n=== Site: ", s, " ===")
+  
+  dates_s <- site_dates %>% filter(site == s) %>% pull(date_id)
+  message("  Sampling dates: ", length(dates_s))
+  
+  date_results <- map(dates_s, function(d) {
+    
+    # Assign the appropriate seasonal diet matrix for this date
+    diet_info <- assign_diet(diet, s, d)
+    diet_mat  <- diet_info$matrix
+    seas      <- diet_info$season
+    
+    if (is.null(diet_mat)) {
+      warning(paste("No diet matrix available for", s, as.character(d), "— skipping"))
+      return(NULL)
+    }
+    
+    # Prep community for this site × date
+    comm_prepped <- prep_community_date(community, s, d, diet_mat)
+    if (is.null(comm_prepped)) return(NULL)
+    
+    # Run fluxes across all bootstraps
+    flux_list <- run_fluxes_date(comm_prepped, diet_mat)
+    if (length(flux_list) == 0) return(NULL)
+    
+    list(
+      flux_list = flux_list,
+      season    = seas,
+      site      = s,
+      date      = d
+    )
+    
+  })
+  
+  names(date_results) <- as.character(dates_s)
+  Filter(Negate(is.null), date_results)
+  
+}) %>% set_names(sites)
+
+```
+
+---
+
+# Flatten to tidy tibbles
+
+Convert the nested list to analysis-ready long-form data.
+
+## Total flux per boot
+
+One row per site × date × boot, with total community flux (J m-2 day-1)
+and consumer-level flux breakdown.
+
+```{r flatten-flux}
+# Total flux per boot
+flux_boots <- map_dfr(sites, function(s) {
+  map_dfr(names(results_flux[[s]]), function(d) {
+    res <- results_flux[[s]][[d]]
+    map_dfr(names(res$flux_list), function(b) {
+      mat <- res$flux_list[[b]]
+      tibble(
+        site        = s,
+        date        = as_date(d),
+        season      = res$season,
+        boot_id     = b,
+        total_flux  = sum(mat), # community-level flux J m-2 day-1
+        n_links     = sum(mat > 0) # number of links in the food web
+      )
+    })
+  })
+}) %>%
+  mutate(
+    site = factor(site, levels = site_order, ordered = TRUE),
+    year = year(date)
+  )
+
+glimpse(flux_boots)
+
+# Consumer-level flux per boot
+# Columns of the flux matrix are consumers; rows are prey
+flux_consumer_boots <- map_dfr(sites, function(s) {
+  map_dfr(names(results_flux[[s]]), function(d) {
+    res <- results_flux[[s]][[d]]
+    sp_order <- rownames(res$flux_list[[1]])
+    consumers <- sp_order[!sp_order %in% basal_taxa]
+    
+    map_dfr(names(res$flux_list), function(b) {
+      mat <- res$flux_list[[b]]
+      # Sum flux into each consumer (column sums, consumer only)
+      consumer_flux <- colSums(mat)[consumers]
+      tibble(
+        site       = s,
+        date       = as_date(d),
+        season     = res$season,
+        boot_id    = b,
+        taxon_id   = names(consumer_flux),
+        flux_J_m2d = consumer_flux
+      )
+    })
+  })
+}) %>%
+  mutate(site = factor(site, levels = site_order, ordered = TRUE))
+
+glimpse(flux_consumer_boots)
+```
+
+## Flux summary: median + 95% CI across boots
+
+```{r flux-summary}
+# --- Per site × date ---
+flux_summary_date <- flux_boots %>%
+  group_by(site, date, season) %>%
+  summarise(
+    flux_median = median(total_flux),
+    flux_lo     = quantile(total_flux, 0.025),
+    flux_hi     = quantile(total_flux, 0.975),
+    flux_mean   = mean(total_flux),
+    flux_sd     = sd(total_flux),
+    n_boots     = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(date_md = format(date, "%m-%d"),
+         date_seasonal = as.Date(paste0("2001-", date_md))) # dummy year for plotting
+
+# --- Per site × season (aggregate dates within season) ---
+flux_summary_seasonal <- flux_boots %>%
+  group_by(site, season) %>%
+  summarise(
+    flux_median = median(total_flux),
+    flux_lo     = quantile(total_flux, 0.025),
+    flux_hi     = quantile(total_flux, 0.975),
+    n_boots     = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(season = factor(season, levels = c("first", "second", "third")))
+
+# --- Annual (all dates per site) ---
+flux_summary_annual <- flux_boots %>%
+  group_by(site) %>%
+  summarise(
+    flux_median = median(total_flux),
+    flux_lo     = quantile(total_flux, 0.025),
+    flux_hi     = quantile(total_flux, 0.975),
+    n_boots     = n(),
+    .groups = "drop"
+  )
+```
+
+---
+
+# Visualize
+
+## Energy flux through time
+
+```{r plot-flux-time, fig.width=10, fig.height=5}
+
+# Fig 1
+ggplot(flux_summary_date,
+       aes(x = date_seasonal, y = flux_median, colour = site, fill = site)) +
+  geom_ribbon(aes(ymin = flux_lo, ymax = flux_hi), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.5) +
+  scale_colour_manual(values = site_colors) +
+  scale_fill_manual(values = site_colors) +
+  scale_y_log10(labels = scales::label_number()) +
+  scale_x_date(
+  breaks = seq(as.Date("2001-01-01"), as.Date("2001-12-01"), by = "1 month"),
+  labels = scales::label_date("%b")   # Jan, Feb, Mar...
+  ) +
+  labs(
+    x = NULL,
+    y = expression("Energy flux (J m"^{-2}*" d"^{-1}*")"),
+    title = "Energy flux across the gradient",
+    subtitle = "Ribbon = 95% CI across bootstrap replicates"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "right",
+        strip.background = element_blank())
+
+
+
+# Summary output for write up:
+
+# Peak flux per site (max median across dates)
+flux_summary_date %>%
+  group_by(site) %>%
+  slice_max(flux_median) %>%
+  select(site, date, flux_median, flux_lo, flux_hi)
+
+# Minimum flux per site
+flux_summary_date %>%
+  group_by(site) %>%
+  slice_min(flux_median) %>%
+  select(site, date, flux_median, flux_lo, flux_hi)
+
+# Seasonal amplitude (max/min ratio) per site
+flux_summary_date %>%
+  group_by(site) %>%
+  summarise(
+    amplitude = max(flux_median) / min(flux_median),
+    .groups = "drop"
+  ) %>% arrange(amplitude)
+
+# Fold difference between hver and st14 at peak
+flux_summary_date %>%
+  filter(month(date) %in% 6:8) %>%
+  group_by(site) %>%
+  summarise(summer_median = median(flux_median), .groups = "drop") %>%
+  summarise(fold_diff = max(summer_median) / min(summer_median))
+
+# Convergence in autumn - range across intermediate sites
+flux_summary_date %>%
+  filter(month(date) %in% 9:11) %>%
+  group_by(site) %>%
+  summarise(autumn_median = median(flux_median), .groups = "drop") %>%
+  summarise(range = max(autumn_median) - min(autumn_median))
+
+# Which taxa are driving the flux change at hver in autumn?
+flux_consumer_boots %>%
+  filter(site == "hver",
+         month(date) %in% 9:11) %>%
+  group_by(date, taxon_id) %>%
+  summarise(flux_median = median(flux_J_m2d), .groups = "drop") %>%
+  arrange(date, desc(flux_median)) %>%
+  print(n = 40)
+
+# Compare summer vs autumn biomass at hver for top taxa
+community %>%
+  filter(site == "hver",
+         month(date_id) %in% c(6:8, 9:11),
+         !taxon_id %in% basal_taxa) %>%
+  mutate(period = if_else(month(date_id) %in% 6:8, "summer", "autumn")) %>%
+  group_by(period, taxon_id, boot_id) %>%
+  summarise(bio = mean(bio_g_m), .groups = "drop") %>%
+  group_by(period, taxon_id) %>%
+  summarise(bio_median = median(bio), .groups = "drop") %>%
+  pivot_wider(names_from = period, values_from = bio_median) %>%
+  mutate(pct_change = 100 * (autumn - summer) / summer) %>%
+  arrange(pct_change) %>%
+  print(n = 20)
+```
+Results: 
+
+Energy flux increased generally with stream temperature but was strongly regulated by season across all sites (Fig. 1). Community-level flux varied drastically across streams and the year, ranging from 0.06 J m-2 d-1 in the coldest stream (st14) in Novemeber to 220 J m-2 d-1 in the warmest (hver) in late August. Fluxes did show seasonal patterning, peaking in summer (June–August) across the gradient, ranging from 132-362 J m-2 d-1 at the warmest site (hver) to 3.82-29.6 J m-2 d-2 at the coldest (st14), representing an approximately 15-fold difference at peak. The warmest stream (hver) sustained the highest fluxes for most of the year, but declined sharply in autumn driven by a synchronized collapse of Naidid and Cricotopus sylvestris biomass — two fast-turnover taxa that dominated summer production at this site but declined by 92% and 83% respectively by October. Notably, this boom-bust dynamic occurred despite geothermal temperatures remaining stable year-round, suggesting that thermal stability does not buffer against the biological instability of fast-cycling summer communities. By late autumn, fluxes converged across the gradient to within 14.2 J m-2 d-1 of one another, suggesting that temperature-driven divergence in energy demand is most pronounced during the productive summer period.
+
+## Total flux across the thermal gradient (annual summary)
+
+```{r plot-flux-gradient, fig.width=6, fig.height=4}
+
+# Fig 2
+ggplot(flux_summary_annual,
+       aes(x = site, y = flux_median, colour = site)) +
+  geom_pointrange(aes(ymin = flux_lo, ymax = flux_hi), size = 0.8) +
+  scale_colour_manual(values = site_colors) +
+  scale_y_log10() +
+  labs(
+    x = "Site (cold to warm)",
+    y = expression("Energy flux (J m"^{-2}*" day"^{-1}*")"),
+    title = "Annual flux across the thermal gradient"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+
+library(ggridges)
+
+# Fig 3
+ggplot(flux_boots,
+       aes(x = log10(total_flux), y = site, fill = site, colour = site)) +
+  geom_density_ridges(alpha = 0.7, scale = 1.2,
+                      quantile_lines = TRUE, quantiles = c(0.025, 0.5, 0.975),
+                      linewidth = 0.4) +
+  scale_fill_manual(values = site_colors) +
+  scale_colour_manual(values = site_colors) +
+  scale_x_continuous(
+    name = expression("log"[10]*" Energy flux (J m"^{-2}*" day"^{-1}*")"),
+    labels = function(x) parse(text = paste0("10^", x))
+  ) +
+  scale_y_discrete(limits = rev(site_order)) +  # cold at top, warm at bottom
+  labs(
+    y = NULL,
+    title = "Energy flux across the thermal gradient",
+    subtitle = "Vertical lines = 2.5th, 50th, 97.5th percentiles"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+
+# Get the actual median values for st14 and hver
+flux_summary_annual %>% 
+  filter(site %in% c("st14", "hver")) %>%
+  select(site, flux_median, flux_lo, flux_hi)
+
+```
+Results: 
+
+Fig 2. When summarized annually, median energy flux increased from the coldest to the warmest stream, ranging from 0.03-29.7 J m-2 d-1 at st14 to 1.92-285 J m-2 d-1 at hver (Fig 2). However, the intermediate sites (oh2, st7, st9, st6) were strikingly similar in annual median flux despite spanning 13°C of temperature difference, suggesting that the relationship between temperature and annual energy demand is nonlinear across the gradient. Bootstrap uncertainty was largest at st14 and hver — the two most thermally extreme sites — likely reflecting high temporal variability in biomass at both ends of the gradient.
+
+Fig. 3. Energy flux distributions were multimodal at all sites, reflecting distinct seasonal flux states rather than a unimodal central tendency. The coldest stream (st14) showed the broadest and most right-skewed distribution, with flux estimates spanning nearly five orders of magnitude — consistent with the high temporal variability driven by Simulium vernum phenology. Intermediate sites (oh2, st7, st9, st6) showed tighter, multimodal distributions with modes corresponding to seasonal flux peaks. The warmest stream (hver) showed the widest absolute range among sites, with a distinct high-flux mode (>10 J m-2 d-1) reflecting summer dominance by fast-turnover taxa and a lower mode reflecting the autumn community collapse.
+
+## Seasonal flux by site
+
+```{r plot-seasonal, fig.width=8, fig.height=4}
+season_labels <- c(first = "Jan–Apr", second = "May–Aug", third = "Sep–Dec")
+
+# Fig 4
+ggplot(flux_summary_seasonal,
+       aes(x = season, y = flux_median, colour = site, group = site)) +
+  geom_pointrange(aes(ymin = flux_lo, ymax = flux_hi),
+                  position = position_dodge(width = 0.1), size = 0.5) +
+  scale_colour_manual(values = site_colors) +
+  scale_x_discrete(labels = season_labels) +
+  scale_y_log10() +
+  labs(
+    x = NULL,
+    y = expression("Energy flux (J m"^{-2}*" day"^{-1}*")"),
+    colour = "Site",
+    title = "Seasonal flux by site"
+  ) +
+  theme_classic(base_size = 12)
+```
+
+## Consumer flux distributions across the gradient
+
+```{r plot-consumer-dist, fig.width=9, fig.height=5}
+# Summarise to median consumer flux per site × taxon for visualization
+consumer_summary <- flux_consumer_boots %>%
+  filter(!taxon_id %in% basal_taxa,
+         flux_J_m2d > 1e-4) %>%
+  group_by(site, taxon_id) %>%
+  summarise(flux_median = median(flux_J_m2d), .groups = "drop") %>%
+  filter(flux_median > 0)
+
+# Fig. 5
+ggplot(consumer_summary,
+       aes(x = site, y = flux_median, colour = site)) +
+  geom_jitter(alpha = 0.7, width = 0.15, size = 1.5) +
+  geom_boxplot(alpha = 0, width = 0.5, outlier.shape = NA) +
+  scale_colour_manual(values = site_colors) +
+  scale_y_log10() +
+  labs(
+    x = "Site (cold → warm)",
+    y = expression("Median consumer flux (J m"^{-2}*" day"^{-1}*")"),
+    title = "Consumer flux distributions across the thermal gradient",
+    subtitle = "Each point = one taxon"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none")
+```
+Results:
+
+Fig. 5. Within-community energy flux was highly unequal at all sites, with a small number of taxa accounting for the majority of total flux while most taxa contributed minimally (Fig. 5). Median consumer flux was lowest at the coldest stream (st14, ~0.03 J m-2 d-1) and highest at the warmest (hver, ~0.3 J m-2 d-1), but the relationship was nonlinear across the gradient — oh2 and st7 showed higher median consumer fluxes than the warmer st9 and st6, consistent with anomalously low total biomass stocks at those sites. The upper tail of the flux distribution — representing dominant consumers — increased more clearly with temperature, with maximum consumer fluxes at hver and st6 exceeding those at cold sites by one to two orders of magnitude. Flux inequality was pronounced across the entire gradient, with interquartile ranges spanning two to three orders of magnitude at most sites, suggesting that a few high-flux taxa structurally dominate energy flow regardless of thermal regime (most weak but some strong links). 
+
+
+# Structural network properties 
+
+```{r}
+network_structural <- map_dfr(sites, function(s) {
+  map_dfr(c("first", "second", "third", "annual"), function(sc) {
+    
+    mat <- if (sc == "annual") {
+      diet[[s]][["annual"]]
+    } else {
+      diet[[s]][["season_means"]][[sc]]
+    }
+    if (is.null(mat)) return(NULL)
+    
+    S_total     <- nrow(mat)
+    S_consumers <- sum(!rownames(mat) %in% basal_taxa)
+    S_basal     <- sum(rownames(mat) %in% basal_taxa)
+    L           <- sum(mat > 0)
+    
+    tibble(
+      site             = s,
+      scale            = sc,
+      S_total          = S_total, # total number of species
+      S_consumers      = S_consumers, # total number of consumers
+      S_basal          = S_basal, # total number of resources (the same for each stream) 
+      L                = L, # number of links
+      link_density     = L / S_total, # number of links / species
+      connectance      = L / S_total^2, # connectance traditional 
+      connectance_bip  = L / (S_consumers * S_basal) # bipartite connectance (no consumer-consumer interaction possible)
+    )
+  })
+}) %>%
+  mutate(site = factor(site, levels = site_order, ordered = TRUE))
+
+print(network_structural)
+
+# Quick visual of connectance
+network_structural %>%
+  filter(scale == "annual") %>%
+  ggplot(aes(x=site,y=connectance_bip, color = site)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = site_colors) +
+  labs(
+    x = NULL,
+    y = expression("Connectance (L/S^2)"),
+  ) +
+  theme_classic(base_size = 12)
+
+```
+Results: 
+
+I think the structural properties of the network are not informative, mostly because species richness does not change within streams (however, it does across streams) and they feed on the same basal resources (essentially diet is fixed across streams and through time), hence why connectance doesn't vary through time. What could be interesting is "rewiring" diet proportions due to drought - which could shifting the relative proportions in consumer diets, or simulating changes to the amount (which currently there is no consideration of this in the analysis). 
+
+
+---
+
+# Save outputs
+
+```{r save-outputs}
+dir.create("data/processed", showWarnings = FALSE, recursive = TRUE)
+
+# Raw flux matrices (input for 02_flux_to_jacobian.Rmd)
+saveRDS(results_flux, "data/processed/results_flux.rds")
+
+# Tidy boot-level summaries (input for further flux analysis)
+saveRDS(flux_boots, "data/processed/flux_boots.rds")
+saveRDS(flux_consumer_boots, "data/processed/flux_consumer_boots.rds")
+
+# Aggregated summaries
+saveRDS(flux_summary_date, "data/processed/flux_summary_date.rds")
+saveRDS(flux_summary_seasonal,"data/processed/flux_summary_seasonal.rds")
+saveRDS(flux_summary_annual, "data/processed/flux_summary_annual.rds")
+
+```

@@ -1,0 +1,1016 @@
+---
+title: "02 — Jacobian Community Matrix"
+author: "Nate Heili"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+
+This script converts bootstrapped energy flux matrices (from `01_energy_flux.Rmd`)
+into **Jacobian community matrices** following the approach of Bazin et al. 2025.
+The Jacobian J describes the per-unit-biomass effect of each species on every other
+species at equilibrium, and its eigenstructure characterizes community stability.
+
+**Why basal biomass matters here:**
+
+`fluxweb` calculates fluxes entirely from the consumer side — metabolic demand
+drives flux, distributed by diet proportions. Basal resource biomass (B_resource)
+does not enter the flux calculation. However, it enters the Jacobian in two places:
+
+1. **Off-diagonal elements** — the per-biomass effect of a basal resource on a
+   consumer, and vice versa:
+   $$J_{consumer,resource} = \frac{ae \cdot F_{ij}}{B_{resource}}$$
+   $$J_{resource,consumer} = \frac{-F_{ij}}{B_{resource}}$$
+
+2. **Diagonal self-damping of basal resources** — unlike consumers, basal resources
+   are not self-limited by metabolic loss. Their self-damping reflects intrinsic
+   population growth rate at carrying capacity:
+   $$J_{ii}^{basal} = -r_i(T)$$
+   where $r_i(T)$ is temperature-dependent specific growth rate (day-1).
+
+With near-zero placeholder biomasses, both terms become ecologically uninterpretable
+(inflated interaction strengths, extreme diagonal dominance). This script replaces
+placeholders with three empirically-grounded scenarios.
+
+**Assumptions (Bazin et al. 2025 framework):**
+
+1. **Steady-state** — the Jacobian is linearised around the equilibrium that the
+   flux matrix represents. Each sampling date is treated as a snapshot of a local
+   quasi-equilibrium.
+2. **Type I linear functional responses** — per-capita effect of consumer on
+   resource is constant regardless of density. Reasonable for generalist grazers
+   in low-predation-risk systems but underestimates nonlinearity at high densities.
+
+**Inputs:**
+- `data/processed/results_flux.rds` — raw flux matrices per site × date × boot
+- `data/processed/flux_boots.rds` — boot-level community summaries
+- `data/community.rds` — biomass and metabolic rates per taxon × site × date × boot
+
+**Outputs:**
+- `data/processed/results_jacobian_[scenario].rds` — Jacobian matrices per scenario
+- `data/processed/interactions_all.rds` — tidy interaction strength distributions
+- `data/processed/jacobian_summary.rds` — scenario comparison summary
+
+---
+
+# Libraries
+
+```{r libraries}
+rm(list = ls())
+
+library(tidyverse)
+library(lubridate)
+```
+
+---
+
+# Load inputs
+
+```{r load-data}
+results_flux <- readRDS("data/processed/results_flux.rds")
+community    <- readRDS("data/community.rds") %>%
+  mutate(date_id = as_date(date_id))
+
+# Site order and colors (consistent with 01_energy_flux.Rmd)
+site_order  <- c("st14", "oh2", "st7", "st9", "st6", "hver")
+site_colors <- c(
+  st14 = "#2C7BB6", oh2 = "#5AAE61", st7 = "#A6D96A",
+  st9  = "#FDAE61", st6 = "#F46D43", hver = "#D73027"
+)
+
+basal_taxa <- c("amorphous_detritus", "animal", "cyanobacteria",
+                "diatom", "filamentous", "green_algae", "plant_material")
+
+sites  <- names(results_flux)
+```
+
+---
+
+# Site temperatures
+
+Used to parameterise temperature-dependent basal growth rates and GPP-based
+biomass scenarios.
+
+```{r site-temperatures}
+k_B <- 8.617e-5  # Boltzmann constant (eV / K)
+
+# Annual mean temperature per site from community data
+site_temps <- community %>%
+  filter(!taxon_id %in% basal_taxa) %>%
+  group_by(site) %>%
+  summarise(
+    kelvin  = mean(kelvin,  na.rm = TRUE),
+    celsius = mean(celcius, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(site = factor(site, levels = site_order, ordered = TRUE)) %>%
+  arrange(site)
+
+print(site_temps)
+```
+
+---
+
+# Basal biomass scenarios
+
+## Background
+
+Basal resource standing stock biomass is not directly measured in the community
+bootstrap data. We implement three scenarios reflecting contrasting hypotheses
+about how warming shapes basal resource availability:
+
+**Scenario 1 — Constant (null baseline):**
+All basal resources assigned 1 g AFDM m-2 regardless of site or taxon. This
+is the standard placeholder used by Gauzens et al. 2019 and Jochum et al. 2021,
+and serves as a baseline against which the empirical scenarios are compared.
+
+**Scenario 2 — GPP-scaled (warming increases basal biomass):**
+Standing stock biomass estimated from gross primary production (GPP) following
+O'Gorman et al. 2016 (Fig 4D):
+
+$$\ln(GPP) = \ln(0.9857) + 0.0756 \cdot T_C$$
+
+where GPP is in g C m-2 d-1. At equilibrium, standing stock equals production divided by specific loss rate B=GPP/r. The temperature dependence of standing stock therefore depends on the *difference* in activation energies between production (E_GPP = 0.54 eV; O'Gorman et al. 2016) and algal-specific growth rate (E_r), reflecting a scenario where algal production scales more steeply with temperature. This produces a positive relationship between standing stock and temperature (E_GPP > E_r). We acknowledge that empirical standing stocks at Hengill are more consistent with the temperature-invariant expectation (E_r = E_GPP) and treat this scenario as an upper bound.
+
+Conversion chain:
+- GPP (g O) to GPP (g C): divide by 2.67 (32 g O₂ / 12 g C)
+- B_algae (g AFDM) = GPP (g C m-2 d-1) / r_algae (d-1) / 0.5 (C:AFDM ratio)
+  where r_algae is the temperature-dependent specific growth rate (see below)
+
+**Scenario 3 — Compositional shift: diatom decline / cyanobacteria proliferation:**
+Warming shifts basal resource *composition* rather than total biomass. Diatoms —
+the most palatable and nutritious resource — decline with warming as cyanobacteria proliferate and
+competitively exclude them. Cyanobacteria are thought to be largely inedible
+to stream invertebrates and occupy near-zero diet proportions in the gut content
+analysis, meaning their high standing stock does not translate into consumer
+energy gain. Total basal biomass *increases* under this scenario (more cyanobacteria
+than diatoms lost), but effective consumer-resource coupling *weakens* because
+the growing resource pool is increasingly inaccessible. This scenario is distinct
+from Scenario 2 in that the mechanism operates through composition and palatability,
+not production rate — and distinct from a simple grazing-pressure story because
+the energy is unavailable to consumers rather than merely consumed faster.
+
+## Temperature-dependent algal growth rate
+
+Used to convert GPP flux to standing stock biomass in Scenario 2, and to
+parameterise basal self-damping diagonals in all scenarios.
+
+Specific growth rate follows the Metabolic Theory of Ecology (MTE):
+$$r(T) = r_{ref} \cdot \exp\!\left(\frac{-E_r}{k_B} \left(\frac{1}{T} - \frac{1}{T_{ref}}\right)\right)$$
+where:
+- $r_{ref}$ = 0.15 day-1 at $T_{ref}$ = 293.15 K (20°C) — mid-range estimate
+  for a mixed benthic algal assemblage (Eppley 1972; Friberg et al. 2009)
+- $E_r$ = 0.32 - activation energy from MTE: biomass accumulates with warming  
+- $k_B$ = Boltzmann constant
+
+**Assumption in Scenario 2**
+Standing stock biomass is estimated from gross primary production (GPP) following
+O'Gorman et al. 2016 (Fig. 4d):
+
+```{r basal-growth-rate}
+E_r   <- 0.32       # activation energy for algal GPP at Hengill (eV)
+r_ref <- 0.15       # specific growth rate at 20°C (d-1) - can vary widely by taxa
+T_ref <- 293.15     # reference temperature (K) from MTE
+
+# Temperature-dependent specific growth rate
+algal_growth_rate <- function(kelvin) {
+  r_ref * exp((-E_r / k_B) * (1/kelvin - 1/T_ref))
+}
+
+# Compute for each site
+site_temps <- site_temps %>%
+  mutate(
+    r_algae = algal_growth_rate(kelvin)
+  )
+
+# Growth rates 
+site_temps %>% select(site, celsius, r_algae) %>% print()
+```
+
+## Compute scenario biomasses
+
+
+```{r basal-biomass-scenarios}
+# Scenario 1: Constant
+B_constant <- 1.0  # g AFDM m-2, Gauzens et al. 2019 / Jochum et al. 2021
+
+# Scenario 2: GPP-scaled biomass 2-10 g AFDM m-2
+# Total algal biomass increases with warming following the shape of the
+# O'Gorman et al. 2016 GPP regression, but constrained to an ecologically
+# realistic range (2-10 g AFDM m-2) consistent with Hengill biofilm
+# measurements (Friberg et al. 2009; Gudmundsdottir et al. 2011).
+# GPP is used to set the relative scaling across sites rather than as
+# a direct biomass estimate, avoiding unrealistic values from the
+# GPP/r equilibrium derivation.
+
+B_gpp_scaled <- site_temps %>%
+  mutate(
+    GPP_gC_per_d  = 0.9857 * exp(0.0756 * celsius),   # O'Gorman et al. 2016
+    # Rescale GPP to 2-10 g AFDM m-2 range
+    GPP_min       = min(GPP_gC_per_d),
+    GPP_max       = max(GPP_gC_per_d),
+    B_algal_total = 2 + (10 - 2) * (GPP_gC_per_d - GPP_min) / (GPP_max - GPP_min)
+  )
+
+# Scenario 3: Resource shift — diatom decline / cyanobacteria increase with warming
+# Net effect: total basal biomass increases with warming, but effective
+# consumer-resource coupling WEAKENS as the edible fraction shrinks
+
+T_cold <- min(site_temps$celsius)
+T_warm <- max(site_temps$celsius)
+
+build_basal_cyano_shift <- function(celsius) {
+  w <- (celsius - T_cold) / (T_warm - T_cold)
+  
+  # Total algal biomass increases with warming
+  # bounded by Gudmundsdóttir et al. 2011; Friberg et 2009 estimates (2-10 g m-2)
+  B_algal_total <- exp(log(2) + (log(10) - log(2)) * w)
+  
+  # Cyanobacteria fraction increases with warming (2-70%)
+  frac_cyano      <- 0.02 + (0.70 - 0.02) * w
+  frac_palatable  <- 1 - frac_cyano   # diatom + green + filamentous combined
+  
+  c(
+    # Palatable taxa: declining share of increasing total
+    # Diatoms dominate palatable fraction (60%), green and filamentous split remainder
+    diatom             = B_algal_total * frac_palatable * 0.60,
+    green_algae        = B_algal_total * frac_palatable * 0.20,
+    filamentous        = B_algal_total * frac_palatable * 0.20,
+    # Cyanobacteria: growing share of increasing total
+    cyanobacteria      = B_algal_total * frac_cyano,
+    # Non-algal resources: site-invariant
+    amorphous_detritus = 1,
+    plant_material     = 1,
+    animal             = 1
+  )
+}
+
+
+map_dfr(site_temps$site, function(s) {
+  temp <- site_temps %>% filter(site == s) %>% pull(celsius)
+  bv   <- build_basal_cyano_shift(temp)
+  tibble(site = s, taxon_id = names(bv), B_gAFDM = as.numeric(bv))
+}) %>%
+  pivot_wider(names_from = taxon_id, values_from = B_gAFDM) %>%
+  print()
+
+# Build per-site lookup tables for each scenario
+basal_biomass_scenarios <- list(
+  
+  # Scenario 1: uniform 1 g AFDM m-2 for all taxa and sites (null baseline)
+  constant = map(sites, function(s) {
+    c(diatom = B_constant, cyanobacteria = B_constant, green_algae = B_constant,
+      filamentous = B_constant, amorphous_detritus = B_constant,
+      plant_material = B_constant, animal = B_constant)
+  }) %>% set_names(sites),
+  
+  # Scenario 2: total algal biomass increases 2-10 g m-2 following GPP shape
+  # composition fixed (diatom dominated); detritus and animal site-invariant
+  gpp_scaled = map(sites, function(s) {
+    B_tot <- B_gpp_scaled %>% filter(site == s) %>% pull(B_algal_total)
+    c(
+      diatom             = B_tot * 0.60,
+      green_algae        = B_tot * 0.20,
+      filamentous        = B_tot * 0.20,
+      cyanobacteria      = 1, # consistent with placeholder constant scenario
+      amorphous_detritus = 1,
+      plant_material     = 1,
+      animal             = 1
+    )
+  }) %>% set_names(sites),
+  
+  # Scenario 3: taxon-specific compositional shift
+  cyano_shift = map(sites, function(s) {
+    temp <- site_temps %>% filter(site == s) %>% pull(celsius)
+    build_basal_cyano_shift(temp)
+  }) %>% set_names(sites)
+)
+```
+
+# Visualize basal resource scenarios
+
+```{r visualize scenarios}
+# Build tidy dataframe of all three scenarios for visualization
+scenario_all <- map_dfr(names(basal_biomass_scenarios), function(sc) {
+  map_dfr(sites, function(s) {
+    bv <- basal_biomass_scenarios[[sc]][[s]]
+    tibble(
+      scenario = sc,
+      site     = s,
+      taxon_id = names(bv),
+      B_gAFDM  = as.numeric(bv)
+    )
+  })
+}) %>%
+  mutate(
+    site     = factor(site, levels = site_order, ordered = TRUE),
+    scenario = factor(scenario,
+                      levels = c("constant", "gpp_scaled", "cyano_shift"),
+                      labels = c("Scenario 1: Constant",
+                                 "Scenario 2: GPP-scaled",
+                                 "Scenario 3: Cyano shift")),
+    taxon_id = factor(taxon_id,
+                      levels = c("diatom", "green_algae", "filamentous",
+                                 "cyanobacteria", "amorphous_detritus",
+                                 "plant_material", "animal"))
+  )
+
+# Stacked bar faceted by scenario
+ggplot(scenario_all,
+       aes(x = site, y = B_gAFDM, fill = taxon_id)) +
+  geom_col(colour = "white", linewidth = 0.3) +
+  facet_wrap(~ scenario, ncol = 1) +
+  scale_fill_manual(values = c(
+    diatom             = "#4E9BB5",  # blue — most palatable
+    green_algae        = "#7CB47E",  # green — palatable
+    filamentous        = "#A8D08D",  # light green — palatable
+    cyanobacteria      = "#C85250",  # red — inedible
+    amorphous_detritus = "#8B6F47",  # brown — detritus
+    plant_material     = "#B5A26E",  # tan — allochthonous
+    animal             = "#D4A0A0"   # pink — meiofauna
+  )) +
+  labs(
+    x    = "Site (cold to warm)",
+    y    = expression("Basal biomass (g AFDM m"^{-2}*")"),
+    fill = "Resource",
+    title    = "Basal resource biomass across three scenarios",
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.background = element_blank(),
+    strip.text       = element_text(face = "bold", size = 11),
+    legend.position  = "right"
+  )
+
+```
+
+---
+
+# Jacobian construction functions
+
+## `flux_to_jacobian_empirical()`
+
+This is an expanded version of the Bazin et al. formulation that properly handles
+basal resources:
+
+**Off-diagonal elements (i ≠ j):**
+$$J_{ij} = \frac{ae_j \cdot F_{ij}}{B_j} - \frac{F_{ji}}{B_j}$$
+
+This is identical to Bazin — we divide all off-diagonal elements by the prey's
+biomass (B_j, column). The change from `01_energy_flux.Rmd` is that B_j for
+basal taxa now comes from the scenario vector rather than near-zero placeholders.
+
+**Diagonal — consumers:**
+$$J_{ii}^{consumer} = -\frac{d_i \cdot B_i + \sum_j F_{ij}}{B_i} = -d_i - \frac{\sum_j F_{ij}}{B_i}$$
+where $d_i$ is mass-specific metabolic loss (J day-1 g-1) and $F_{ij}$ is flux
+out of species i to all consumers.
+
+**Diagonal — basal resources:**
+$$J_{ii}^{basal} = -r_i(T)$$
+where $r_i(T)$ is the temperature-dependent specific algal growth rate (day-1).
+For detritus: assigned -0.01 day-1 (slow decomposition / slow replenishment).
+For animal diet item: assigned intermediate -0.05 day-1.
+
+This replaces the metabolic loss diagonal used for consumers — basal resources
+are self-limited by growth, not metabolic demand.
+
+```{r fn-jacobian}
+flux_to_jacobian_empirical <- function(flux_mat,
+                                       biomass_vec,     # consumer biomasses (g m-2)
+                                       loss_vec,        # mass-specific metabolic loss (J d-1 g-1)
+                                       ae_vec,          # assimilation efficiencies
+                                       basal_bio_vec,   # basal biomass (g AFDM m-2)
+                                       r_basal,         # algal growth rate (day-1)
+                                       r_detritus = 0.01,  # decomposition / replenishment rate
+                                       r_animal   = 0.05   # meiofaunal growth rate
+                                       ) {
+  
+  n        <- nrow(flux_mat)
+  sp_order <- rownames(flux_mat)
+  
+  # Identify basal vs consumer indices
+  is_basal    <- sp_order %in% basal_taxa
+  is_algal    <- sp_order %in% c("diatom", "filamentous", "green_algae", "cyanobacteria")
+  is_detritus <- sp_order %in% c("amorphous_detritus", "plant_material")
+  is_animal   <- sp_order %in% c("animal")
+  is_consumer <- !is_basal
+  
+  # Build full biomass vector: consumers from bootstrap, basal from scenario
+  full_bio <- biomass_vec
+  for (tax in names(basal_bio_vec)) {
+    if (tax %in% sp_order) {
+      full_bio[sp_order == tax] <- basal_bio_vec[tax]
+    }
+  }
+  
+  # Guard: check for zero/NA in full_bio
+  if (any(is.na(full_bio)) || any(full_bio <= 0)) {
+    problem <- sp_order[is.na(full_bio) | full_bio <= 0]
+    warning(paste("Zero/NA biomass for:", paste(problem, collapse = ", ")))
+    return(NULL)
+  }
+  
+  # --- Off-diagonal: Bazin formulation ---
+  # J[i,j] = ae_j * F[j,i] / B_j - F[i,j] / B_j
+  # flux_mat is prey(row) × consumer(col): F[prey, consumer]
+  # t(flux_mat) is consumer(row) × prey(col): which consumer eats which prey
+  # ae applied column-wise (ae belongs to the prey being eaten)
+  
+  jacob <- t(flux_mat) * ae_vec - flux_mat   # prey × prey matrix of net flows
+  jacob <- sweep(jacob, MARGIN = 2, full_bio, "/")  # divide columns by biomass
+  
+  # Diagonal
+  for (i in seq_len(n)) {
+    
+    if (is_consumer[i]) {
+      # Consumer diagonal: metabolic loss + predation loss, normalised by biomass
+      metabolic_loss <- loss_vec[i]                            # already per gram
+      predation_loss <- sum(flux_mat[i, ]) / full_bio[i]      # flux out / biomass
+      jacob[i, i]    <- -(metabolic_loss + predation_loss)
+      
+    } else if (is_algal[i]) {
+      # Algal diagonal: intrinsic growth rate (self-damping)
+      # Negative sign: at carrying capacity, net growth rate → 0, self-damping = r
+      jacob[i, i] <- -r_basal
+      
+    } else if (is_detritus[i]) {
+      jacob[i, i] <- -r_detritus
+      
+    } else if (is_animal[i]) {
+      jacob[i, i] <- -r_animal
+    }
+  }
+  
+  rownames(jacob) <- colnames(jacob) <- sp_order
+  jacob
+}
+```
+
+## `extract_interactions()`
+
+Extracts off-diagonal Jacobian elements as a tidy tibble for distribution analysis.
+
+```{r fn-interactions}
+extract_interactions <- function(J, consumer_only = TRUE) {
+  
+  sp_order <- rownames(J)
+  if (consumer_only) {
+    sp_keep  <- sp_order[!sp_order %in% basal_taxa]
+    J        <- J[sp_keep, sp_keep, drop = FALSE]
+    sp_order <- sp_keep
+  }
+  
+  expand.grid(recipient = sp_order, actor = sp_order,
+              stringsAsFactors = FALSE) %>%
+    as_tibble() %>%
+    filter(recipient != actor) %>%
+    mutate(
+      interaction_strength = map2_dbl(recipient, actor, ~ J[.x, .y]),
+      direction = case_when(
+        interaction_strength > 0 ~ "positive",
+        interaction_strength < 0 ~ "negative",
+        TRUE                     ~ "zero"
+      )
+    ) %>%
+    filter(interaction_strength != 0)
+}
+```
+
+---
+
+# Get community str estimates for each boot
+
+This code takes a while to run. It essentially organizes the community structure data for Jacobian estimation (biomasses, metabolic losses) with the energy flux matrices for east site, date, and bootstrap.
+
+```{r}
+# Pre-compute all per-site x date x boot community data ONCE
+# outside any scenario loop — this never changes across scenarios
+
+community_prepped <- map(sites, function(s) {
+  message("Prepping community: ", s)
+  
+  dates_s <- names(results_flux[[s]])
+  
+  map(dates_s, function(d) {
+    date_val  <- as_date(d)
+    flux_ex   <- results_flux[[s]][[d]]$flux_list[[1]]  # example matrix
+    sp_order  <- rownames(flux_ex)
+    consumers <- sp_order[!sp_order %in% basal_taxa]
+    boot_ids  <- names(results_flux[[s]][[d]]$flux_list)
+    
+    # Basal AE: pulled once per site x date (invariant across boots)
+    basal_ae <- community %>%
+      filter(site == s, date_id == date_val, taxon_id %in% basal_taxa) %>%
+      group_by(taxon_id) %>%
+      summarise(ae_temp = mean(ae_temp, na.rm = TRUE), .groups = "drop")
+    
+    # Global minimums for placeholder logic: once per site x date
+    global_min_bio  <- community %>%
+      filter(site == s, date_id == date_val,
+             !taxon_id %in% basal_taxa, bio_g_m > 0) %>%
+      pull(bio_g_m) %>% min(na.rm = TRUE)
+    
+    global_min_loss <- community %>%
+      filter(site == s, date_id == date_val,
+             !taxon_id %in% basal_taxa, metrate_J_day_gram > 0) %>%
+      pull(metrate_J_day_gram) %>% min(na.rm = TRUE)
+    
+    # Pull all boots at once for this site x date, then split
+    comm_all <- community %>%
+      filter(site == s, date_id == date_val,
+             taxon_id %in% consumers,
+             boot_id %in% boot_ids) %>%
+      group_by(boot_id, taxon_id) %>%
+      summarise(
+        bio_g_m            = mean(bio_g_m,            na.rm = TRUE),
+        metrate_J_day_gram = mean(metrate_J_day_gram,  na.rm = TRUE),
+        ae_temp            = mean(ae_temp,             na.rm = TRUE),
+        .groups = "drop"
+      )
+    
+    # Build pre-assembled vectors per boot
+    boot_vecs <- map(boot_ids, function(b) {
+      
+      comm_b <- comm_all %>%
+        filter(boot_id == b) %>%
+        arrange(match(taxon_id, sp_order))
+      
+      if (nrow(comm_b) == 0) return(NULL)
+      
+      bio_vec  <- setNames(rep(0, length(sp_order)), sp_order)
+      loss_vec <- setNames(rep(0, length(sp_order)), sp_order)
+      ae_vec   <- setNames(rep(0, length(sp_order)), sp_order)
+      
+      bio_vec[comm_b$taxon_id]  <- comm_b$bio_g_m
+      loss_vec[comm_b$taxon_id] <- comm_b$metrate_J_day_gram
+      ae_vec[comm_b$taxon_id]   <- comm_b$ae_temp
+      
+      # Basal AE from community.rds
+      ae_vec[basal_ae$taxon_id] <- basal_ae$ae_temp
+      
+      # Placeholder for zero consumer biomass
+      consumer_idx <- sp_order %in% consumers
+      zero_idx     <- consumer_idx & bio_vec == 0
+      if (any(zero_idx)) {
+        bio_vec[zero_idx]  <- global_min_bio  * 0.01
+        loss_vec[zero_idx] <- global_min_loss * 0.01
+        ae_vec[zero_idx & ae_vec == 0] <- 0.906
+      }
+      
+      list(bio_vec = bio_vec, loss_vec = loss_vec, ae_vec = ae_vec)
+    }) %>% set_names(boot_ids)
+    
+    list(
+      boot_vecs = boot_vecs,
+      sp_order  = sp_order
+    )
+    
+  }) %>% set_names(dates_s)
+  
+}) %>% set_names(sites)
+
+message("Community pre-computation complete")
+```
+
+# Build Jacobians across all scenarios
+
+```{r constant}
+sc <- "constant"
+message("Running scenario: ", sc)
+
+results_jacobian_constant <- map(sites, function(s) {
+  basal_bio <- basal_biomass_scenarios[[sc]][[s]]
+  r_site    <- site_temps %>% filter(site == s) %>% pull(r_algae)
+  
+  map(names(results_flux[[s]]), function(d) {
+    prepped  <- community_prepped[[s]][[d]]
+    flux_res <- results_flux[[s]][[d]]
+    
+    jacob_list <- map(names(flux_res$flux_list), function(b) {
+      vecs <- prepped$boot_vecs[[b]]
+      if (is.null(vecs)) return(NULL)
+      
+      tryCatch(
+        flux_to_jacobian_empirical(
+          flux_mat      = flux_res$flux_list[[b]],
+          biomass_vec   = vecs$bio_vec,
+          loss_vec      = vecs$loss_vec,
+          ae_vec        = vecs$ae_vec,
+          basal_bio_vec = basal_bio,
+          r_basal       = r_site
+        ),
+        error = function(e) NULL
+      )
+    }) %>% set_names(names(flux_res$flux_list))
+    
+    Filter(Negate(is.null), jacob_list)
+    
+  }) %>% set_names(names(results_flux[[s]]))
+  
+}) %>% set_names(sites)
+
+saveRDS(results_jacobian_constant, "data/processed/results_jacobian_constant.rds")
+```
+
+
+
+
+
+```{r main-loop, cache=TRUE}
+sc <- "gpp_scaled"
+message("Running scenario: ", sc)
+
+results_jacobian_GPPscaled <- map(sites, function(s) {
+  basal_bio <- basal_biomass_scenarios[[sc]][[s]]
+  r_site    <- site_temps %>% filter(site == s) %>% pull(r_algae)
+  
+  map(names(results_flux[[s]]), function(d) {
+    prepped  <- community_prepped[[s]][[d]]
+    flux_res <- results_flux[[s]][[d]]
+    
+    jacob_list <- map(names(flux_res$flux_list), function(b) {
+      vecs <- prepped$boot_vecs[[b]]
+      if (is.null(vecs)) return(NULL)
+      
+      tryCatch(
+        flux_to_jacobian_empirical(
+          flux_mat      = flux_res$flux_list[[b]],
+          biomass_vec   = vecs$bio_vec,
+          loss_vec      = vecs$loss_vec,
+          ae_vec        = vecs$ae_vec,
+          basal_bio_vec = basal_bio,
+          r_basal       = r_site
+        ),
+        error = function(e) NULL
+      )
+    }) %>% set_names(names(flux_res$flux_list))
+    
+    Filter(Negate(is.null), jacob_list)
+    
+  }) %>% set_names(names(results_flux[[s]]))
+  
+}) %>% set_names(sites)
+
+saveRDS(results_jacobian_GPPscaled, "data/processed/results_jacobian_GPPscaled.rds")
+```
+
+```{r}
+sc <- "cyano_shift"
+message("Running scenario: ", sc)
+
+results_jacobian_cyano_shift <- map(sites, function(s) {
+  basal_bio <- basal_biomass_scenarios[[sc]][[s]]
+  r_site    <- site_temps %>% filter(site == s) %>% pull(r_algae)
+  
+  map(names(results_flux[[s]]), function(d) {
+    prepped  <- community_prepped[[s]][[d]]
+    flux_res <- results_flux[[s]][[d]]
+    
+    jacob_list <- map(names(flux_res$flux_list), function(b) {
+      vecs <- prepped$boot_vecs[[b]]
+      if (is.null(vecs)) return(NULL)
+      
+      tryCatch(
+        flux_to_jacobian_empirical(
+          flux_mat      = flux_res$flux_list[[b]],
+          biomass_vec   = vecs$bio_vec,
+          loss_vec      = vecs$loss_vec,
+          ae_vec        = vecs$ae_vec,
+          basal_bio_vec = basal_bio,
+          r_basal       = r_site
+        ),
+        error = function(e) NULL
+      )
+    }) %>% set_names(names(flux_res$flux_list))
+    
+    Filter(Negate(is.null), jacob_list)
+    
+  }) %>% set_names(names(results_flux[[s]]))
+  
+}) %>% set_names(sites)
+
+saveRDS(results_jacobian_cyano_shift, "data/processed/results_jacobian_cyano_shift.rds")
+
+```
+
+---
+
+# Extract interaction strength distributions
+
+For each scenario, extract off-diagonal Jacobian elements and summarize (mean +/- 95% bootstrap interval). This links energy fluxes to the distribution of interaction strengths.
+
+```{r extract-interactions}
+
+summarise_jacobian_boots <- function(jacobian_scenario) {
+  
+  map(names(jacobian_scenario), function(s) {
+    message("Summarising: ", s)
+    
+    map(names(jacobian_scenario[[s]]), function(d) {
+      
+      boot_mats <- jacobian_scenario[[s]][[d]]
+      boot_mats <- Filter(Negate(is.null), boot_mats)
+      if (length(boot_mats) == 0) return(NULL)
+      
+      # Stack all boot matrices into a 3D array: [row, col, boot]
+      sp_order <- rownames(boot_mats[[1]])
+      n        <- length(sp_order)
+      n_boots  <- length(boot_mats)
+      
+      arr <- array(
+        unlist(boot_mats),
+        dim = c(n, n, n_boots),
+        dimnames = list(sp_order, sp_order, names(boot_mats))
+      )
+      
+      # Element-wise mean and 95% CI across boots (3rd dimension)
+      J_mean <- apply(arr, c(1, 2), mean,            na.rm = TRUE)
+      J_lo   <- apply(arr, c(1, 2), quantile, 0.025, na.rm = TRUE)
+      J_hi   <- apply(arr, c(1, 2), quantile, 0.975, na.rm = TRUE)
+      
+      list(
+        mean    = J_mean,
+        lo      = J_lo,
+        hi      = J_hi,
+        n_boots = n_boots
+      )
+      
+    }) %>% set_names(names(jacobian_scenario[[s]]))
+    
+  }) %>% set_names(names(jacobian_scenario))
+}
+
+# Run for each scenario
+message("Summarising constant...")
+jacobian_summary_constant    <- summarise_jacobian_boots(results_jacobian_constant)
+
+message("Summarising GPP-scaled...")
+jacobian_summary_gpp         <- summarise_jacobian_boots(results_jacobian_GPPscaled)
+
+message("Summarising cyano shift...")
+jacobian_summary_cyano       <- summarise_jacobian_boots(results_jacobian_cyano_shift)
+
+
+
+# Fix alignment — pivot all three matrices identically
+mat_to_long <- function(mat) {
+  as.data.frame(mat) %>%
+    rownames_to_column("recipient") %>%
+    pivot_longer(-recipient, names_to = "actor", values_to = "value")
+}
+
+
+# Make a df of interaction strengths from the Jacobian
+interactions_all <- map_dfr(
+  list(constant    = jacobian_summary_constant,
+       gpp_scaled  = jacobian_summary_gpp,
+       cyano_shift = jacobian_summary_cyano),
+  function(sc_summary) {
+    map_dfr(sites, function(s) {
+      map_dfr(names(sc_summary[[s]]), function(d) {
+        
+        res <- sc_summary[[s]][[d]]
+        if (is.null(res)) return(NULL)
+        
+        # Pivot all three matrices the same way then join
+        df_mean <- mat_to_long(res$mean) %>% rename(mean_strength = value)
+        df_lo   <- mat_to_long(res$lo)   %>% rename(lo_strength   = value)
+        df_hi   <- mat_to_long(res$hi)   %>% rename(hi_strength   = value)
+        
+        df_mean %>%
+          left_join(df_lo, by = c("recipient", "actor")) %>%
+          left_join(df_hi, by = c("recipient", "actor")) %>%
+          filter(recipient != actor, mean_strength != 0) %>%
+          mutate(
+            site               = s,
+            date               = as_date(d),
+            log10_abs_mean     = log10(abs(mean_strength)),
+            log10_abs_lo       = log10(abs(lo_strength)),
+            log10_abs_hi       = log10(abs(hi_strength)),
+            direction          = if_else(mean_strength > 0, "positive", "negative"),
+            recipient_is_basal = recipient %in% basal_taxa,
+            actor_is_basal     = actor     %in% basal_taxa,
+            interaction_type   = case_when(
+              !recipient_is_basal & actor_is_basal  ~ "consumer_resource",
+              recipient_is_basal  & !actor_is_basal ~ "resource_consumer",
+              !recipient_is_basal & !actor_is_basal ~ "consumer_consumer",
+              TRUE                                  ~ "resource_resource"
+            )
+          ) %>%
+          select(-recipient_is_basal, -actor_is_basal)
+      })
+    })
+  },
+  .id = "scenario"
+) %>%
+  mutate(
+    site     = factor(site,     levels = site_order, ordered = TRUE),
+    scenario = factor(scenario, levels = c("constant", "gpp_scaled", "cyano_shift"))
+  )
+
+# Remove placeholder taxa — that have a near-zero biomass value and inflate J
+interactions_real <- interactions_all %>%
+  filter(round(lo_strength, 8) != round(hi_strength, 8)) %>%
+  mutate(julian = yday(date))
+```
+
+---
+
+# Visualise interaction strength distributions
+
+## Consumer-resource coupling |J[consumer,resource]|
+We quantified consumer-resource coupling as the off-diagonal Jacobian elements J[consumer, resource] = ae × F_rc / B_resource, representing the per-unit-biomass effect of each basal resource on each consumer's population growth rate at equilibrium. These elements integrate empirically-estimated energy fluxes (F_rc; J m-2 day-1) with temperature-adjusted assimilation efficiencies (ae) and scenario-specific basal resource biomass (B_resource; g AFDM m-2), yielding interaction strengths in units of day-1. For each site and sampling date, we summarized the distribution of J[consumer, resource] across all realized consumer-resource pairs, excluding taxa with near-zero placeholder biomass that produced uninformative near-zero interactions. We report the median and interquartile range of |J[c,r]| as a measure of community-wide coupling strength, where higher values indicate stronger per-biomass consumer dependence on basal resources and greater potential for resource fluctuations to propagate into consumer dynamics.
+
+```{r |J(c,r)|}
+# Quick boxplot visual of J[c,r] across gradient, faceted by scenario
+interactions_real %>%
+  filter(interaction_type == "consumer_resource",
+         is.finite(log10_abs_mean)) %>%
+  ggplot(aes(x = site, y = log10_abs_mean, colour = site)) +
+  geom_boxplot() +
+  facet_wrap(~ scenario) +
+  scale_colour_manual(values = site_colors) +
+  labs(x = "Site (cold to warm)",
+       y = expression(log[10]*"|J[consumer,resource]|",
+       title = "Consumer-resource coupling across the thermal gradient")) +
+  theme_classic() +
+  theme(legend.position = "none")
+
+# Interactions through time
+interactions_real %>%
+  filter(interaction_type == "consumer_resource",
+         scenario == "constant",
+         is.finite(log10_abs_mean)) %>%
+  group_by(site, date) %>%
+  summarise(
+    median_coupling = median(log10_abs_mean),
+    lo_coupling     = quantile(log10_abs_mean, 0.25),
+    hi_coupling     = quantile(log10_abs_mean, 0.75),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    doy  = yday(date),
+    site = factor(site, levels = site_order, ordered = TRUE)
+  ) %>%
+  ggplot(aes(x = doy, y = median_coupling,
+             colour = site, fill = site)) +
+  geom_ribbon(aes(ymin = lo_coupling, ymax = hi_coupling),
+              alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = site_colors, name = "Site") +
+  scale_fill_manual(values = site_colors,   name = "Site") +
+  scale_x_continuous(
+    breaks = yday(as.Date(paste0("2011-", 1:12, "-01"))),
+    labels = month.abb,
+    limits = c(1, 365)
+  ) +
+  labs(
+    x        = NULL,
+    y        = expression("log|J[consumer,resource]|"),
+    title    = "Seasonal dynamics of consumer-resource coupling",
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "right",
+    axis.text.x     = element_text(size = 9)
+  ) +
+  facet_wrap(~site)
+
+# Check how scenarios influence interaction strengths
+interactions_real %>%
+  filter(interaction_type == "consumer_resource",
+         is.finite(log10_abs_mean)) %>%
+  group_by(scenario, site) %>%
+  summarise(
+    median_coupling = median(log10_abs_mean),
+    lo_coupling     = quantile(log10_abs_mean, 0.25),
+    hi_coupling     = quantile(log10_abs_mean, 0.75),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = site, y = median_coupling,
+             colour = scenario, group = scenario)) +
+  geom_pointrange(
+    aes(ymin = lo_coupling, ymax = hi_coupling),
+    position = position_dodge(width = 0.4),
+    size = 0.6
+  ) +
+  scale_colour_manual(
+    values = c(constant = "grey40", gpp_scaled = "#E69F00", cyano_shift = "#C85250"),
+    labels = c("Constant", "GPP-scaled", "Cyano shift")
+  ) +
+  labs(
+    x      = "Site (cold → warm)",
+    y      = expression("Median log"[10]*"|J[consumer,resource]|"),
+    colour = "Basal biomass scenario",
+    title  = "Scenario sensitivity: consumer-resource coupling",
+    subtitle = "Median +/- 95% bootstrap interval"
+  ) +
+  theme_classic(base_size = 12)
+
+```
+# Results: Interaction strengths from the Jacobian matrix
+Consumer-resource interactions increased generally with warming, with the highest values in hver. Interstingly, there was lower CR coupling in st6 and st9 (17.6 and 11.1 C, respectively) relative to oh2 and st7 (5.64 and 5.98 C, respectively), a result that follows the energy flux patterning. oh2 and st7 have diverse communities (N = 31) with fairly high biomasses, which increase their per-capita effect on resources. 
+
+Scenario specific changes to basal biomasses only influenced interactions in the warmer streams (hver, st6, st9). Increasing basal biomasses slightly lowered interaction strengths, or how tightly consumers are coupled to their resources, but if compisition shifts towards cyanobacteria, interactions go up (based on GCA analysis). This shows that there are potential for compensatory dynamics from increased primary production on the stability in warmed systems; consumers can offset some of their energetic demand if food resources are available to them. I think these scenarios will be more interesting as I develop ways to incorporate real basal resource biomass into the energy flux analysis and Jacobian.
+
+Seasonal dynamics of CR interactions were most dynamic in the warmest stream - hver - where interaction strengths went up during hotter summer months. This results is driven by increases in consumer biomasses - notably Naidid + Cricotopus - increasing their overall energetic needs relative to the set basal resource stock. This may be an artifcat of the way it is modeled here where basal resources have no temporal dynamics, which is clearly not the case as primary production follows a somewhat similar patterning to consumers, peaking in the summer. Incorportaing temproal patterning may offset these coupling effects. Interestingly cold sites (st14) show the opposite: coupling is generally weak and relatively flat seasonally, potentially from low-biomass slow-turnover communities.
+
+## Consumer-resource interactions |J(resource,consumer)| - Predation pressure
+
+Ecologically these elements of the Jacobian represent how much a consumer supresses its resource per unit consumer biomass per day. Higher values mean the consumers has stronger top-down efect on the resource. The values are assymetric - a consumer can be weakly stimulated by a resource (low J[c,r]) but still exter strong suppression on it (high J[r,c]) if consumer biomass is high relative to flux.
+
+```{r |J(r,c)|}
+# Grazing pressure: J[resource, consumer]
+interactions_real %>%
+  filter(interaction_type == "resource_consumer",
+         is.finite(log10_abs_mean)) %>%
+  group_by(site) %>%
+  summarise(
+    median_grazing = median(log10_abs_mean),
+    lo_grazing     = quantile(log10_abs_mean, 0.25),
+    hi_grazing     = quantile(log10_abs_mean, 0.75),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = site, y = median_grazing,
+             colour = site, group = site)) +
+  geom_pointrange(
+    aes(ymin = lo_grazing, ymax = hi_grazing),
+    position = position_dodge(width = 0.4),
+    size = 0.6
+  ) +
+  scale_colour_manual(values = site_colors
+  ) +
+  labs(
+    x        = "Site (cold to warm)",
+    y        = expression("Median log|J[resource,consumer]|"),
+    colour   = "Site",
+    title    = "Grazing pressure across the thermal gradient",
+    subtitle = "Per-unit-consumer-biomass suppression of basal resources"
+  ) +
+  theme_classic(base_size = 12)
+
+interactions_real %>%
+  filter(interaction_type == "resource_consumer",
+         scenario == "constant",
+         is.finite(log10_abs_mean)) %>%
+  group_by(site, date) %>%
+  summarise(
+    median_coupling = median(log10_abs_mean),
+    lo_coupling     = quantile(log10_abs_mean, 0.25),
+    hi_coupling     = quantile(log10_abs_mean, 0.75),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    doy  = yday(date),
+    site = factor(site, levels = site_order, ordered = TRUE)
+  ) %>%
+  ggplot(aes(x = doy, y = median_coupling,
+             colour = site, fill = site)) +
+  geom_ribbon(aes(ymin = lo_coupling, ymax = hi_coupling),
+              alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_colour_manual(values = site_colors, name = "Site") +
+  scale_fill_manual(values = site_colors,   name = "Site") +
+  scale_x_continuous(
+    breaks = yday(as.Date(paste0("2011-", 1:12, "-01"))),
+    labels = month.abb,
+    limits = c(1, 365)
+  ) +
+  labs(
+    x        = NULL,
+    y        = expression("log|J[resource,consumer]|"),
+    title    = "Seasonal dynamics of predation pressure",
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "right",
+    axis.text.x     = element_text(size = 9)
+  )
+
+```
+
+---
+
+# Save outputs
+
+```{r save-outputs}
+# I use the constant scenario from above for stability given limited changes to Jacobian matrices no matter basal biomass
+results_jacobian <- results_jacobian_constant
+
+dir.create("data/processed", showWarnings = FALSE, recursive = TRUE)
+
+# Full nested Jacobian list (input for 03_stability.Rmd)
+saveRDS(results_jacobian, "data/processed/results_jacobian.rds")
+
+```
